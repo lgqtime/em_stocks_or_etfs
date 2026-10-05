@@ -1,0 +1,18 @@
+# 密钥与运行时产物——绝不入库
+.env
+.cache/
+runs/
+releases/*/runs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 临时探针脚本
+_probe*.py
+_probe*.json
+_probe*.txt
+_*.log
+_*.txt
+SSH_KEY/
