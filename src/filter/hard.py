@@ -133,20 +133,40 @@ def hard_filter_2(news: list[dict]) -> tuple[list[dict], list[dict], list[str]]:
 
 
 # --- 第 3 关：行业推举排序（纯代码筛选器，不是生产者）-----------------------
+# 同号同级时的档位优先序（越小越优先）：
+#   P1 > C1 = E1 > P2 > C2 = E2 > P3 = C3 = E3 > P4 = C4 = E4
+# 设计含义：政策优先只在【第 1、2 档】成立 —— P1/P2 抬到同号 C/E 之上；
+# 第 3、4 档（都是弱档）则与同号 C/E 并列，即"弱档层面，政策文件的边际信息量
+# 不比公司/事件的实质动作更大"（P3 再量化也只是规划，不等于订单）。
+# ⚠️ 因为 P3/P4 处破例，这个序【不是算术式】，必须显式写表；改序请直接改这张表。
+TIER_PRIORITY = {
+    "P1": 0, "C1": 1, "E1": 1,
+    "P2": 2, "C2": 3, "E2": 3,
+    "P3": 4, "C3": 4, "E3": 4,
+    "P4": 5, "C4": 5, "E4": 5,
+}
+
+
+def tier_rank(t: str) -> int:
+    """档位的综合位次（越小越优先）。未知档位排最后。"""
+    return TIER_PRIORITY.get(t, 99)
+
+
 def rank_industries(tiers: dict[str, list[str]], order: list[str]) -> list[dict]:
-    """排序键：有无强档 → 强档数量 → 最高档位 → 弱档数量 → 既有顺序。"""
+    """排序键：有无强档 → 强档数量 → 最高档位（见 TIER_PRIORITY）→ 弱档数量 → 既有顺序。"""
     strong_set = {"P1", "P2", "C1", "C2", "E1", "E2"}
-    rank_of = {f"{p}{i}": i for p in "PCE" for i in (1, 2, 3, 4)}
     rows = []
     for idx, name in enumerate(order):
         ts = tiers.get(name, [])
         strong = [t for t in ts if t in strong_set]
         weak = [t for t in ts if t not in strong_set]
+        best = min(strong, key=tier_rank) if strong else None
         rows.append({
             "industry": name,
             "has_strong": 1 if strong else 0,
             "strong_n": len(strong),
-            "best_rank": min((rank_of[t] for t in strong), default=9),
+            "best_tier": best,
+            "best_rank": tier_rank(best) if best else 99,
             "weak_n": len(weak),
             "tiers": ts,
             "_idx": idx,

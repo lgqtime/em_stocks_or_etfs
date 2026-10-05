@@ -30,6 +30,9 @@ SINA_US = ("https://stock.finance.sina.com.cn/usstock/api/jsonp.php/x/"
 SINA_FUT = ("https://stock2.finance.sina.com.cn/futures/api/jsonp.php/x/"
             "GlobalFuturesService.getGlobalFuturesDailyKLine")
 TX_HK = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+# 同一台服务器的备用入口：web. 前缀那个会被腾讯 WAF 拦（HTTP 501 挑战页），
+# 不带前缀的入口实测可用。主入口失败时自动回落（实测 2026-10-05 主入口全程 501）。
+TX_HK_ALT = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
 
 # key -> (源, 该源的代码)。与 quotes.SYMBOLS 的 key 一一对应。
 SRC: dict[str, tuple[str, str]] = {
@@ -82,10 +85,19 @@ def _bars(client, kind: str, code: str) -> list[dict]:
         return [{"date": r["date"][:10], "open": _f(r.get("open")),
                  "close": _f(r.get("close"))} for r in rows if r.get("date")]
     if kind == "hk":
-        j = client.get_json(TX_HK, params={"param": f"{code},day,,,320,qfq"})
-        node = (j.get("data") or {}).get(code) or {}
-        rows = node.get("day") or node.get("qfqday") or []
-        return [{"date": p[0], "open": _f(p[1]), "close": _f(p[2])} for p in rows]
+        last_err = None
+        for url in (TX_HK, TX_HK_ALT):
+            try:
+                j = client.get_json(url, params={"param": f"{code},day,,,320,qfq"})
+            except Exception as e:  # noqa: BLE001 - 逐入口回落
+                last_err = f"{url.split('/')[2]}: {type(e).__name__}"
+                continue
+            node = (j.get("data") or {}).get(code) or {}
+            rows = node.get("day") or node.get("qfqday") or []
+            if rows:
+                return [{"date": p[0], "open": _f(p[1]), "close": _f(p[2])} for p in rows]
+            last_err = f"{url.split('/')[2]}: 无 day 数据"
+        raise RuntimeError(f"港股日线取不到（{last_err}）")
     raise ValueError(f"未知源类型：{kind}")
 
 

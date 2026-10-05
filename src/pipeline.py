@@ -32,7 +32,8 @@ notes: list[str] = []
 
 # 档位强弱（与 config/tier_rules.json 的 tier_sets 一致，此处是代码侧常量）
 STRONG_TIERS = {"P1", "P2", "C1", "C2", "E1", "E2"}
-T_RANK = {f"{p}{i}": i for p in "PCE" for i in (1, 2, 3, 4)}
+# 档位综合位次：同号时 P > C = E（政策优先）。与 hard.tier_rank 同一口径。
+T_RANK = {f"{p}{i}": hard.tier_rank(f"{p}{i}") for p in "PCE" for i in (1, 2, 3, 4)}
 
 
 def _quota_of(quota: dict, industry: str) -> int:

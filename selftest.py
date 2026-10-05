@@ -57,6 +57,34 @@ tiers = {"甲": ["P4", "P4", "P4", "P4"], "乙": ["C3"], "丙": ["C1"], "丁": [
 order = ["甲", "乙", "丙", "丁", "戊"]
 ranked = [r["industry"] for r in hard.rank_industries(tiers, order)]
 assert ranked == ["丁", "戊", "丙", "甲", "乙"], ranked   # 强档优先；同强档数比最高档；无强档比弱档数
+assert [r["best_tier"] for r in hard.rank_industries(tiers, order)][0] == "P1", \
+    "同强档数时应取最高档位"
+
+# 同号同级的政策优先序（用户定案 A）：
+#   P1 > C1 = E1 > P2 > C2 = E2 > P3 = C3 = E3 > P4 = C4 = E4
+# 政策优先只在前两档成立；第 3、4 档是弱档，与同号 C/E 并列。
+assert hard.tier_rank("P1") < hard.tier_rank("C1") == hard.tier_rank("E1"), "P1 应优先于 C1=E1"
+assert hard.tier_rank("P2") < hard.tier_rank("C2") == hard.tier_rank("E2"), "P2 应优先于 C2=E2"
+assert hard.tier_rank("P3") == hard.tier_rank("C3") == hard.tier_rank("E3"), \
+    "第3档：P3 与 C3/E3 并列（A 方案在 P3 处破例）"
+assert hard.tier_rank("P4") == hard.tier_rank("C4") == hard.tier_rank("E4"), \
+    "第4档：P4 与 C4/E4 并列"
+# 号小优先于号大（跨字母亦然：P2 优先于 C1 之外的一切第3档）
+assert hard.tier_rank("P1") < hard.tier_rank("P2") < hard.tier_rank("P3") < hard.tier_rank("P4")
+assert hard.tier_rank("E1") < hard.tier_rank("C2"), "E1（强档）应优先于 C2"
+# 完整序列必须与用户指定的一致
+_EXPECT = ["P1", "C1", "E1", "P2", "C2", "E2", "P3", "C3", "E3", "P4", "C4", "E4"]
+assert sorted(_EXPECT, key=lambda t: (_EXPECT.index(t), hard.tier_rank(t))) == _EXPECT
+_ordered = sorted(_EXPECT, key=lambda t: (hard.tier_rank(t), _EXPECT.index(t)))
+assert _ordered == _EXPECT, f"优先序与规格不符：{_ordered}"
+# 三个行业各持同号强档 → 持 P1/P2 的排前，持 C1/E1 的并列
+_t = {"甲": ["E1"], "乙": ["P1"], "丙": ["C1"]}
+_r = [r["industry"] for r in hard.rank_industries(_t, ["甲", "乙", "丙"])]
+assert _r[0] == "乙", f"持 P1 的应排第一，实际 {_r}"
+assert set(_r) == {"甲", "乙", "丙"}
+# pipeline 的档位位次必须与 hard 同源，否则 Agent5 配额与第3关会口径不一致
+from src import pipeline as _PL
+assert _PL.T_RANK == {t: hard.tier_rank(t) for t in _PL.T_RANK}, "T_RANK 与 tier_rank 不一致"
 
 # --- 提示词渲染 --------------------------------------------------------------
 assert "1. 国家政策" in P.agent1() and "14. 其他-杂/弱信号" in P.agent1()
@@ -119,16 +147,25 @@ assert "不要求点名池内公司" in a4, "E1 未说明可不点名"
 assert "强档 = " not in a4 and "弱档 = " not in a4, "提示词不应出现强弱档归类表"
 assert "E3 是弱档" not in a4, "不应在提示词里替模型判定 E3 的强弱"
 assert "E3 是弱档" not in P.agent42(), "Agent42 不应把 E3 当错误去纠正"
-# C/E 边界：C 类只适用于主体在池内的消息；资本运作按主体位置分流
+# C/E 边界：C 类只适用于主体在池内的消息；资本运作按【动作主体】三方分流
 assert "只适用于主体本身就在池内的消息" in a4, "Agent4 未声明 C 类的主体边界"
-assert "不得判 C4" in a4 and "大行获注资" in a4, "Agent4 缺资本运作分流规则"
+assert "走 P 类" in a4, "Agent4 缺『政府出资是政策不是公司行为』的分流"
 assert "只适用于主体就在池内" in P.agent42(), "Agent42 未复核 C/E 边界"
-_rules_c = configs.load_tier_rules()
-assert "c_tier_boundary" in _rules_c, "tier_rules 缺 c_tier_boundary"
-_split = _rules_c["c_tier_boundary"]["capital_operation_split"]
-assert _split["subject_in_pool"]["tier"] == "C" and _split["subject_out_of_pool"]["tier"] == "E", _split
-_cp = [x for x in _rules_c["code_prejudge"]["recommended"] if "池外" in x["kind"]]
-assert _cp and _cp[0]["tier"] == "E2" and "不得判 C4" in _cp[0]["guard"], _cp
+
+# P 与 C/E 互斥且【先判 P】：政策主体是政府，不因受益方在池外而降成 E
+assert "判定顺序" in a4 and "最先判 P" in a4, "Agent4 未声明先判 P 的顺序"
+assert "P 类不受主体位置影响" in a4, "Agent4 未声明 P 不受主体位置影响"
+assert "只有【不是 P】时" in a4, "Agent4 未说明非 P 才分支到 C/E"
+assert "不得因为受益方在池外就把一条政策降成 E" in P.agent42(), "Agent42 未复核 P 分支"
+_rules_p = configs.load_tier_rules()["judging_rules"]
+for _k in ("_order", "_p_ignores_subject_position", "_capital_operation_triage"):
+    assert _k in _rules_p, f"tier_rules 的 judging_rules 缺 {_k}"
+_cp = [x for x in configs.load_tier_rules()["code_prejudge"]["recommended"]
+       if x["kind"].startswith("融资资本运作")]
+# 该段【不进提示词】（已断言），只是给"代码预判"留的规格；真正的分流顺序在提示词里。
+assert _cp, "code_prejudge 应保留融资资本运作的规格"
+assert not [x for x in _cp if x["kind"] == "融资资本运作"], \
+    "融资资本运作应已按动作主体拆分为三条分流"
 assert "零未来信息约束" in a4 and "发布时间【之后】才知道的任何信息" in a4, "Agent4 缺零未来信息约束"
 assert "零未来信息" in P.agent42(), "Agent42 缺零未来信息约束"
 assert "零未来信息" in P.agent6("- X(000001)"), "Agent6 缺零未来信息约束"
