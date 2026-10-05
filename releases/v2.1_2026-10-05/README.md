@@ -8,27 +8,6 @@ T 日 09:00 运行，用「快讯 + 外围夜盘」预测该买哪只标的
 持有 1 个交易日：T 日开盘买、T+1 日开盘卖。允许空仓，空仓是正常结论。
 ```
 
-## 环境（虚拟环境）
-
-项目跑在自己的 `.venv` 里，**不要用全局 Python**（实测全局是 openai 2.x，venv 是 3.x，
-两者接口有差异）。
-
-```bash
-python -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt      # Windows
-# source .venv/bin/activate && pip install -r requirements.txt   # Linux/macOS
-```
-
-之后一律用 venv 的解释器：
-
-```bash
-.venv\Scripts\python.exe -m src predict 2026-09-10
-.venv\Scripts\python.exe selftest.py
-```
-
-`requirements.txt` 是 `pip freeze` 出来的**全量锁定**（含传递依赖），
-venv 内真机调用已验证通过。
-
 ## 用法
 
 ```bash
@@ -38,13 +17,11 @@ python -m src backtest 2026-09-08 2026-09-10
 python -m src evaluate 2026-09-10        # 用已落盘的决策复盘单日收益
 
 python -m src.release v2.0 "说明"        # 原则三：版本留档 + SHA256 清单
-python preflight.py 2026-09-10           # 数据源体检（含窗口越界断言）
 python repeat.py 2026-09-10 3            # 同一输入反复跑，量出模型随机的摆幅
 python selftest.py                       # 三关硬过滤 / 第3关排序 / 提示词渲染 / 行情口径自检
-python showprompts.py                    # 打印每个 Agent 实际发出的提示词
 ```
 
-密钥放 `.env` 的 `DEEPSEEK_API_KEY`（`.env` 已在 `.gitignore`，不会入库）。
+依赖：`requests`、`openai`（当前环境已装）。密钥放 `.env` 的 `DEEPSEEK_API_KEY`。
 
 ## 链路
 

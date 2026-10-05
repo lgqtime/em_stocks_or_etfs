@@ -1,0 +1,32 @@
+{
+ "version": "v2.0",
+ "files": {
+  ".gitignore": "b6af13bed6c55e06e217029622856abe55e4034b15d26dfbb2452f0d6abb9406",
+  "CHANGELOG.md": "7f663846628f670a0200277ea9f10873f21ed4314f6b608fb1a2f75289c81c39",
+  "config/audit_blacklist.json": "e7ad119dfc1c73ee1c12869d8204649b5ba615c4f6c3467a4a14a81c22195f1f",
+  "config/etfs.json": "1fbb7ac98b3b561ff54cce5114bd161ce84c04b7d932fd9e19ad2bbafebd9d09",
+  "config/stocks.json": "69a4db3af6c6cdab450a096450d5f4a2beadfbdd78ebbde514609a32d2cac37b",
+  "config/tier_rules.json": "977bdb14915b9b7a248bad74ac663197b585a8daeae04e1be30ad79ef5aa12af",
+  "PROJECT_PLAN_V2.md": "b76e41f42efaf4d977461e83daaffe3e618f512f2f546abb74972e4b03e0d332",
+  "README.md": "7cee301c67f31d55ddd492f8330d2f6e5739a7516f45de53cc9f1aafbbd09c29",
+  "repeat.py": "40a7c232c87c748f376c1cb3fdc94d03f6ecbb506273f33e034da876bc6ffa5e",
+  "selftest.py": "057e5c5f3278c431750c97dd11a3610e104fc4b0fcc63705aa0311b98ca3dc0f",
+  "src/__init__.py": "ce5e2589fbce3109d50ea81737cdd855536469eaa807b8c8eb04b4197ae3749d",
+  "src/__main__.py": "d13f2490efc6fe2e64aa8add922c8c5a2fc8a9a3787a9a134640e28373c89791",
+  "src/backtest.py": "89628e3b3be941b7784346c089c1f2f39e6c05df6ff1697064857076d639f728",
+  "src/cli.py": "a16e46f23fb42b288754068f93a9ec88934e4a0baed713f25d5509d9a41cd255",
+  "src/collect/__init__.py": "802b9bcdaff6b2f82a3dc349eedcc67af3036112111f83b783abccca452c04b0",
+  "src/collect/news.py": "7cfde6eb0b292c48cf17a921c6d7505482347d518ab59ba94f37863e0c07b76f",
+  "src/collect/quotes.py": "c6742e144acfd097b9295d2ead4d9503a704dc62ed8796cd00f3f3da8d55d8f1",
+  "src/configs.py": "b49a68fdb98c97d24f8ce825cec969043c376ea5c6a85a0c7eee1ad9ce052279",
+  "src/filter/__init__.py": "afd738c539430ae0f55c8c55391e225487d8b862d5099bb018c9585b7b79729a",
+  "src/filter/hard.py": "5a35363207f9b15fc2e017f9584dc259cf3e2c58914846b64c9301ace1aca94b",
+  "src/http.py": "3f94616b98954740205cf3b09afe89a2a20c079a1c10527fb04f5f3d6b06051b",
+  "src/llm/__init__.py": "ee296f97c08868bf91f1d92b46e7d5996e694a309407718ca87c325bea4a7181",
+  "src/llm/client.py": "859509d627b44ad6182144e364ce189304d3aa79202c57094cab5c9d62cc656a",
+  "src/llm/prompts.py": "7c81a0481324bde3d79f44ad1fa3c4d1b37b2e5c8a315667aab90fbfc8790b66",
+  "src/market.py": "e45b4830153fb770dbaa20dde680274467e645042ac03ef405efda90de26d23c",
+  "src/pipeline.py": "5b1f480baec6c42c5ec45c4e3114f58b5ecab950a6cca4edb37c6400a144f3ac",
+  "src/release.py": "e3a16055aeaf1b5d50a83546d49b6115b99ccac5f6bf90cb25a2f3a7fa69ea02"
+ }
+}
