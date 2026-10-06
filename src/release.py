@@ -38,8 +38,9 @@ def build(version: str, note: str) -> Path:
                     ignore=shutil.ignore_patterns(*SKIP_DIRS))
     # report.py / showprompts.py 也是项目的一部分：留档要"打开就能跑"，
     # 少了它们就无法复现决策报告与提示词检视。之前漏了两个，已补。
-    for name in ("README.md", ".gitignore", "selftest.py", "repeat.py", "preflight.py",
-                 "report.py", "showprompts.py"):
+    # requirements.txt 同样必需 —— 没有依赖清单，"打开就能跑"就无从谈起。
+    for name in ("README.md", ".gitignore", "requirements.txt", "selftest.py",
+                 "repeat.py", "preflight.py", "report.py", "showprompts.py"):
         f = ROOT / name
         if f.exists():
             shutil.copy2(f, dest / name)

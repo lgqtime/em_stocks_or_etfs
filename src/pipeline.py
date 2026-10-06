@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import json
+import re
 import time
 from pathlib import Path
 
@@ -32,6 +33,9 @@ notes: list[str] = []
 
 # 档位强弱（与 config/tier_rules.json 的 tier_sets 一致，此处是代码侧常量）
 STRONG_TIERS = {"P1", "P2", "C1", "C2", "E1", "E2"}
+# 判定"同一事件"的标题相似度阈值。比第0关的标题去重（0.95）宽松：
+# 那关是"几乎完全一样才剔"，这里是"同一件事的不同叙述也要合并"。
+SAME_EVENT_SIM = 0.80
 # 档位综合位次：同号时 P > C = E（政策优先）。与 hard.tier_rank 同一口径。
 T_RANK = {f"{p}{i}": hard.tier_rank(f"{p}{i}") for p in "PCE" for i in (1, 2, 3, 4)}
 
@@ -120,7 +124,8 @@ class Ctx:
         self.drops[stage] = records
         self.save(f"filtered/{stage}_dropped.json", [
             {k: v for k, v in r.items() if k in ("code", "showTime", "title", "category",
-                                                 "industry", "drop_reason")}
+                                                 "industry", "tier", "stock",
+                                                 "drop_reason")}
             for r in records])
 
     def kept(self, stage: str, records: list[dict]) -> None:
@@ -403,6 +408,20 @@ def stage_agent4(ctx: Ctx, upstream) -> list[dict]:
     return _apply_tiers(ctx, items, out, stage="agent4")
 
 
+def lock_p_tier(a4_tier: str, downstream_tier: str) -> tuple[str, bool]:
+    """P 档锁：Agent4 判出的 P 档，下游任何人不得改动。
+
+    返回 (最终档位, 是否驳回了下游的改动)。
+    依据：P 类判的是"政府/监管机构有没有改变经营约束"，属客观事实判断；
+    C/E 才依赖传导链与池内外关系，需要下游复核。故 P 不参与下游改档。
+    """
+    a4_tier = (a4_tier or "").strip()
+    downstream_tier = (downstream_tier or "").strip()
+    if a4_tier.startswith("P") and downstream_tier != a4_tier:
+        return a4_tier, True
+    return downstream_tier, False
+
+
 def stage_agent42(ctx: Ctx, upstream) -> list[dict]:
     items = ctx.stage_input("agent42", upstream, lambda: ctx.load("analysis/agent4_tiers.json"))
     out: dict[str, dict] = {}
@@ -417,7 +436,7 @@ def stage_agent42(ctx: Ctx, upstream) -> list[dict]:
     for r in results:
         out.update(_index(r))
 
-    kept, changed = [], 0
+    kept, changed, p_locked = [], 0, []
     for n in items:
         rec = out.get(n["code"]) or {}
         is_per = n.get("industry") == hard.PERIPHERY_INDUSTRY
@@ -431,13 +450,32 @@ def stage_agent42(ctx: Ctx, upstream) -> list[dict]:
             t = (rec.get("tier") or "").strip()
             if t in _ALL_TIERS:
                 tier = t
+        # --- P 档锁：Agent4 判出的 P 档，下游【任何人不得改动】-----------------
+        # 依据：P 类判的是"政府/监管机构有没有改变经营约束"，这是客观事实判断，
+        # 不像 C/E 那样依赖传导链与池内外关系的解释，故不需要下游再解释一遍。
+        # 这里用代码硬拦，而不是靠提示词 —— 提示词约束在本项目已被绕过多次。
+        a4_tier = (n.get("tier") or "").strip()
+        tier, locked = lock_p_tier(a4_tier, tier) if not is_per else (tier, False)
+        if locked:
+            p_locked.append({"code": n["code"], "a4": a4_tier, "tried": rec.get("tier"),
+                             "title": n.get("title", "")})
+        why = rec.get("why", "")
+        if locked:
+            why = f"[P 档锁定] 下游试图由 {a4_tier} 改为 {rec.get('tier')}，已驳回；" \
+                  f"P 档以 Agent4 判级为准。原复核意见：{why}"
         changed += int(bool(rec.get("changed")))
         kept.append({**n, "tier": tier, "direction": direction,
                      "ts": n.get("ts", 0),
-                     "a42_why": rec.get("why", ""),
+                     "a42_why": why,
+                     "a42_p_locked": locked,
                      "a42_removed": False})        # 审查层不得移除任何消息
     ctx.save("analysis/agent42_tiers.json", kept)
-    ctx.mark("agent42_档位审查", 输入=len(items), 输出=len(kept), 有调整=changed)
+    if p_locked:
+        ctx.drop("p_lock", [{"code": x["code"], "title": x["title"],
+                             "drop_reason": f"P 档锁定：{x['tried']} → {x['a4']}"}
+                            for x in p_locked])
+    ctx.mark("agent42_档位审查", 输入=len(items), 输出=len(kept), 有调整=changed,
+             P档锁定驳回=len(p_locked))
     return kept
 
 
@@ -480,6 +518,55 @@ def stage_f3(ctx: Ctx, upstream) -> tuple[list[dict], list[str], list[dict]]:
     ctx.save("filtered/f3_selected.json", {"selected": top, "periphery_count": len(per)})
     ctx.mark("f3_行业推举", 候选行业=len(order), 入选=len(top), 入选名单=top)
     return ind, per, top
+
+
+def _same_event(a: dict, b: dict) -> bool:
+    """两条消息是不是"同一件事"。
+
+    只用标题/摘要在【去掉标题里的方括号前缀后】的包含关系与字符集相似度判断。
+    实测案例：`功率大厂瑞萨电子再发涨价函` 与
+    `功率大厂瑞萨电子再发涨价函 AI机柜功率跃升打开行业成长空间` —— 同一条消息的
+    两种叙述，Agent5 会当成两件独立的事，必须由代码合并。
+    """
+    ta, tb = hard.norm_title(a.get("title", "")), hard.norm_title(b.get("title", ""))
+    if not ta or not tb:
+        return False
+    if ta in tb or tb in ta:                      # 一条是另一条的前缀/子串
+        return True
+    sa, sb = hard.norm_title(a.get("summary", "")), hard.norm_title(b.get("summary", ""))
+    if sa and sb and (sa in sb or sb in sa):
+        return True
+    return hard.similar(ta, tb) >= SAME_EVENT_SIM
+
+
+def _dedup_same_event(items: list[dict], data: dict) -> tuple[set[str], list[tuple]]:
+    """同业内把"同一件事"合并成一条，保留档位更强/时间更新的那条。
+
+    返回 (幸存 code 集合, 合并记录)。合并记录写进 meta.json 供审计。
+    """
+    keep: set[str] = set()
+    merged: list[tuple] = []
+    groups: dict[str, list[dict]] = {}
+    for n in items:
+        if n["industry"] == "外围":
+            groups.setdefault(f"外围/{n.get('direction') or '中性'}", []).append(n)
+        else:
+            groups.setdefault(n["industry"], []).append(n)
+    for _, group in groups.items():
+        winners: list[dict] = []
+        for n in sorted(group, key=_rank_key):     # 强档/新者优先成为代表
+            dup = next((w for w in winners if _same_event(n, w)), None)
+            if dup is None:
+                winners.append(n)
+                keep.add(n["code"])
+            else:
+                merged.append((n["code"], dup["code"]))
+                for blk in data.get("industries", []):
+                    if blk.get("industry") == n["industry"]:
+                        blk.setdefault("dropped", []).append(
+                            {"code": n["code"], "dup_of": dup["code"],
+                             "why": "代码判定为同一事件（Agent5 漏合并）"})
+    return keep, merged
 
 
 def _rank_key(n: dict) -> tuple:
@@ -557,6 +644,14 @@ def stage_agent5(ctx: Ctx, upstream, top: list[str]) -> tuple[list[dict], str, d
                 survivor.discard(dup)
                 survivor.add(n["code"])
 
+    # 代码兜底去重：Agent5 靠不住（实测把同一条瑞萨涨价函因措辞不同算成两条
+    # 独立事件，虚增了证据数）。这里对它返回的幸存集合再做一次同事件合并，
+    # 保证下游"五条独立事件"的前提是干净的。合并规则见 _dedup_same_event。
+    survivor, merged = _dedup_same_event(
+        [by_code[c] for c in survivor if c in by_code], data)
+    for pair in merged:
+        errors.append(f"Agent5 漏合并的同一事件：{pair[0]} 与 {pair[1]} 视为重复，已合并")
+
     # 代码裁剪：行业按各自上限，外围按方向桶上限
     final: set[str] = set()
     per_by_dir: dict[str, list[dict]] = {}
@@ -564,6 +659,7 @@ def stage_agent5(ctx: Ctx, upstream, top: list[str]) -> tuple[list[dict], str, d
         per_by_dir.setdefault(n.get("direction") or "中性", []).append(n)
     for direction, group in per_by_dir.items():
         limit = buckets.get(direction, buckets.get("中性", 2))
+        group = [n for n in group if n["code"] in survivor]
         final.update(n["code"] for n in _cap(group, limit))
     for name in top:
         group = [n for n in ind if n["industry"] == name and n["code"] in survivor]
@@ -588,13 +684,102 @@ def stage_agent5(ctx: Ctx, upstream, top: list[str]) -> tuple[list[dict], str, d
     return selected, data.get("periphery_note", ""), data
 
 
-def _ctx_parts(ctx: Ctx, selected: list[dict], top: list[str], per_note: str):
+def stage_agent52(ctx: Ctx, upstream, top: list[str]) -> dict:
+    """把每个行业的精选消息，归属到该行业的候选股票；指不上的归入「其他」。
+
+    · 允许一条消息对应多只候选股
+    · 只允许使用该行业的候选股（越界由代码剔除）
+    · ETF 层【不受本阶段影响】—— Agent62 仍直读 Agent5 的输出（见 _ctx_parts）
+    """
+    a5 = ctx.stage_input("agent52", upstream, lambda: ctx.load("analysis/agent5_selected.json"))
+    kept = set(a5.get("kept_codes", []))
+    a42 = ctx.stage_input("agent52b", None, lambda: ctx.load("analysis/agent42_tiers.json"))
+    by_code = {n["code"]: n for n in a42}
+
+    result: dict[str, dict] = {}
+    for name in top:
+        pool = ctx.stocks
+        cands = pool.items_of_l1.get(name, [])
+        group = [n for n in by_code.values()
+                 if n.get("industry") == name and n["code"] in kept]
+        if not group:
+            result[name] = {"maps": [], "other": [], "candidates": [c.code for c in cands]}
+            continue
+        clist = "\n".join(f"- {c.code} {c.name}｜{c.level3}｜{c.scope[:60]}" for c in cands)
+        user = ("为下列精选摘要指出它指向哪只候选股票：\n"
+                + "\n".join(f"[{i}] code={n['code']} [{n['tier']}] {n['title']}\n"
+                            f"    摘要：{n['summary']}"
+                            for i, n in enumerate(group)))
+        res = ctx.llm.call("agent52", P.agent52(name, clist or "（本行业无候选股票）"),
+                           user, tag=f"agent52:{name}")
+        allowed = {c.code for c in cands}
+        maps, mapped = [], set()
+        try:
+            data = res.json()
+        except ValueError:
+            data = {}
+            errors.append(f"agent52[{name}] 输出无法解析，本行业全部归「其他」：{_short(res)}")
+        for it in (data.get("maps") or []):          # 注意：Agent52 的键是 maps，不是 items
+            if not isinstance(it, dict):
+                continue
+            code = str(it.get("code") or "")
+            picked = [str(s) for s in (it.get("stocks") or []) if str(s) in allowed]
+            if code in kept and picked:
+                maps.append({"code": code, "stocks": picked, "why": it.get("why", "")})
+                mapped.add(code)
+        other = [n["code"] for n in group if n["code"] not in mapped]
+        result[name] = {"maps": maps, "other": other,
+                        "candidates": [c.code for c in cands]}
+
+    ctx.save("analysis/agent52_mapping.json", result)
+    ctx.save("analysis/agent52_mapping.md", _md_agent52(result, by_code, top))
+    ctx.mark("agent52_消息到个股", 入选行业=top,
+             映射条数={k: len(v["maps"]) for k, v in result.items()},
+             其他条数={k: len(v["other"]) for k, v in result.items()})
+    return result
+
+
+def stage_f4(ctx: Ctx, upstream, top: list[str]) -> tuple[dict, list[dict]]:
+    """第 4 关：剔除归入「其他」的消息。落盘 f4_kept / f4_dropped，可逐条审计。"""
+    mapping = ctx.stage_input("f4", upstream, lambda: ctx.load("analysis/agent52_mapping.json"))
+    a5 = ctx.stage_input("f4b", None, lambda: ctx.load("analysis/agent5_selected.json"))
+    a42 = ctx.stage_input("f4c", None, lambda: ctx.load("analysis/agent42_tiers.json"))
+    by_code = {n["code"]: n for n in a42}
+
+    kept_rows, dropped_rows = [], []
+    for name in top:
+        blk = mapping.get(name, {})
+        for m in blk.get("maps", []):
+            for s in m["stocks"]:
+                n = by_code.get(m["code"], {})
+                kept_rows.append({"code": m["code"], "industry": name,
+                                  "stock": s, "tier": n.get("tier", ""),
+                                  "title": n.get("title", "")})
+        for c in blk.get("other", []):
+            n = by_code.get(c, {})
+            dropped_rows.append({"code": c, "industry": name,
+                                 "drop_reason": f"找不到候选股归属[{name}]",
+                                 "tier": n.get("tier", ""), "title": n.get("title", "")})
+    ctx.save("filtered/f4_kept.json", kept_rows)
+    ctx.save("filtered/f4_dropped.json", dropped_rows)
+    ctx.drop("f4", dropped_rows)
+    ctx.mark("f4_剔除其他", 输入=len(kept_rows) + len(dropped_rows),
+             保留=len(kept_rows), 剔除=len(dropped_rows))
+    return mapping, dropped_rows
+
+
+def _ctx_parts(ctx: Ctx, selected: list[dict], top: list[str], per_note: str,
+               evidence: str | None = None):
     """给决策/审计的两块上下文，严格分开：
 
     · 外盘指数：独立的行情参数，原样传下游，不占外围消息配额、不参与行业排序
     · 外围消息：Agent5 按方向分桶去重后的原文
+
+    evidence 由调用方给：Agent6 用 hard_filter_4 之后的【每股一束】证据；
+    Agent62 用 Agent5 的原始行业级证据（ETF 层不经过 f4）。
     """
-    evidence = _evidence_text(selected, top)
+    if evidence is None:
+        evidence = _evidence_text(selected, top)
     per = [n for n in selected if n.get("industry") == hard.PERIPHERY_INDUSTRY]
     periphery = (f"【外盘指数（独立行情参数，非消息、不评级、不参与合成计数）】\n"
                  f"{quotes_mod.quotes_text(ctx.quotes)}\n\n"
@@ -606,12 +791,29 @@ def _ctx_parts(ctx: Ctx, selected: list[dict], top: list[str], per_note: str):
 
 def stage_agent6(ctx: Ctx, upstream, top: list[str], per: list[dict],
                  per_note: str) -> dict:
+    """股票层：证据为 hard_filter_4 之后的【每股一束】（不含归入「其他」的消息）。
+
+    P1 闸门：审计否决且理由涉及 P1 时，插入一次 ETF 决策（Agent62）。
+    插入用的是【行业级证据】（同 Agent5 的精选，与阶段2 的 ETF 层一致），
+    但阶段2 本身不走这个钩子 —— 它维持原样。
+    """
     selected = ctx.stage_input("agent6", upstream,
                                lambda: ctx.load("analysis/agent5_selected.json"))
     pool = ctx.stocks
     cand = pool.candidates_text(top)
-    evidence, periphery = _ctx_parts(ctx, selected, top, per_note)
-    return _decide(ctx, "agent6", P.agent6(cand), pool, evidence, periphery, top)
+    mapping = ctx.load("analysis/agent52_mapping.json")
+    evidence = _evidence_by_stock(ctx, mapping, top)
+    evidence, periphery = _ctx_parts(ctx, selected, top, per_note, evidence=evidence)
+    etf_pool = ctx.etfs
+    etf_evidence, etf_periphery = _ctx_parts(ctx, selected, top, per_note)
+
+    def _etf_hook():
+        """返回 (system, pool, evidence, periphery, _)，供 _decide 插入使用。"""
+        return (P.agent62(etf_pool.candidates_text(top)), etf_pool,
+                etf_evidence, etf_periphery, None)
+
+    return _decide(ctx, "agent6", P.agent6(cand), pool, evidence, periphery, top,
+                   etf_hook=_etf_hook)
 
 
 def stage_agent62(ctx: Ctx, upstream, top: list[str], per: list[dict], per_note: str) -> dict:
@@ -637,17 +839,68 @@ def _evidence_text(selected: list[dict], top: list[str]) -> str:
     return "\n".join(parts)
 
 
+def _audit(ctx: Ctx, plan: dict, rnd: int, schema: str, history: list[str]) -> dict:
+    """跑一次审计并解析结论。"""
+    aud = ctx.llm.call("audit", P.audit(P.gap_enum(), "、".join(history) or "无"),
+                       f"{schema}\n\n【待审方案】\n{json.dumps(plan, ensure_ascii=False, indent=1)}",
+                       tag=f"audit:r{rnd}")
+    try:
+        return aud.json()
+    except ValueError:
+        return {"verdict": "不认可", "gap_type": "证据缺失",
+                "gap_detail": f"审计输出无法解析：{aud.error or '格式错误'}",
+                "what_would_change_my_mind": "重试", "periphery_view": ""}
+
+
+_P1_RE = re.compile(r"\bP1\b|P1档|P1 档|P1强档|P1 强档")
+# 这几种 gap_type 是【P 档专用】的否决理由（见 tier_rules 的 p_tier_protection）：
+# 它们只可能出现在"被否的是 P 档"的场合，故一并视为"涉及 P1"。
+_P_GAP_TYPES = ("主体不在池",)
+
+
+def _gap_touches_p1(verdict: dict, plan: dict) -> bool:
+    """审计的否决是否【涉及 P1】（用户定义：否决的档位是 P1）。
+
+    判据（收紧版，避免把 P4 也算进来）：
+      · 被否方案的 tier_basis 里【明确含 P1】
+      · 或审计理由里【明确出现 P1 字样】
+      · 或用的是 P 档专用的 gap_type（见 tier_rules → p_tier_protection）
+    """
+    if any("P1" in str(x) for x in (plan.get("tier_basis") or [])):
+        return True
+    blob = " ".join(str(verdict.get(k) or "") for k in
+                    ("gap_type", "gap_detail", "what_would_change_my_mind"))
+    if _P1_RE.search(blob):
+        return True
+    return (verdict.get("gap_type") or "") in _P_GAP_TYPES
+
+
+_MAX_ETF_INSERTS = 3          # 与轮次上限一致：插入本身消耗一轮
+
+
 def _decide(ctx: Ctx, agent: str, system: str, pool: Pool,
-            evidence: str, periphery: str, top: list[str]) -> dict:
-    """决策 + 审计回退（最多 3 轮）。3 轮仍不认可 → 空仓。"""
+            evidence: str, periphery: str, top: list[str], *,
+            etf_hook=None) -> dict:
+    """决策 + 审计回退（最多 3 轮）。3 轮仍不认可 → 空仓。
+
+    etf_hook（仅股票层用）：审计【不认可且理由涉及 P1】时，插入一次 ETF 决策。
+      · 插入【消耗一轮】（与股票层共用那 3 轮），最多插 3 次
+      · ETF 插入也只审一次；不被认可以后回到股票层，用剩余轮数继续
+      · 阶段2 的 ETF 层（stage_agent62）不走这个 hook，维持原样
+    """
     schema = (f"【精选证据】\n{evidence}\n\n【外围（外盘指数 + 外围消息原文）】\n{periphery}\n\n"
               f"入选的 5 个行业：{'、'.join(top)}")
     history: list[str] = []
     rejected: list[dict] = []
+    chosen: list[dict] = []          # P1 插入的 ETF 尝试记录（写进产物供审计）
     prev = None
-    for rnd in range(1, 4):
-        if rnd == 1:
-            res = ctx.llm.call(agent, system, schema, tag=f"{agent}:r{rnd}")
+    inserts = 0
+    consumed = 0                     # 已消耗的轮数（股票尝试与 ETF 插入共用）
+    while consumed < 3:
+        consumed += 1                                # 本轮（股票尝试）消耗一轮
+        tag_r = consumed
+        if prev is None:
+            res = ctx.llm.call(agent, system, schema, tag=f"{agent}:r{tag_r}")
         else:
             res = ctx.llm.call(agent, system,
                                schema + "\n\n" + P.retry(
@@ -656,7 +909,7 @@ def _decide(ctx: Ctx, agent: str, system: str, pool: Pool,
                                    rejected[-1].get("what_would_change_my_mind", ""),
                                    json.dumps(prev, ensure_ascii=False))
                                + "\n注意：本次必须换一个论证角度，不得与原方案雷同。",
-                               tag=f"{agent}:r{rnd}")
+                               tag=f"{agent}:r{tag_r}")
         try:
             plan = res.json()
         except ValueError:
@@ -672,33 +925,67 @@ def _decide(ctx: Ctx, agent: str, system: str, pool: Pool,
             else:
                 plan = {**plan, "code": item.code, "name": item.name}
 
-        aud = ctx.llm.call("audit", P.audit(P.gap_enum(), "、".join(history) or "无"),
-            f"{schema}\n\n【待审方案】\n{json.dumps(plan, ensure_ascii=False, indent=1)}",
-            tag=f"audit:r{rnd}")
-        try:
-            verdict = aud.json()
-        except ValueError:
-            verdict = {"verdict": "不认可", "gap_type": "证据缺失",
-                       "gap_detail": f"审计输出无法解析：{aud.error or '格式错误'}",
-                       "what_would_change_my_mind": "重试", "periphery_view": ""}
-
+        verdict = _audit(ctx, plan, tag_r, schema, history)
         if verdict.get("verdict") == "认可":
-            return {**plan, "rounds": rnd, "audit": verdict, "audit_history": rejected}
+            return {**plan, "rounds": consumed, "audit": verdict, "audit_history": rejected,
+                    "p1_etf_inserts": chosen}
         gap = verdict.get("gap_type") or "证据缺失"
         if gap in history:                       # 保险：每轮 gap_type 必须不同
             verdict = {**verdict, "gap_type": gap,
                        "_strike": "本轮 gap_type 与历史同类 → 直接空仓"}
             rejected.append(verdict)
             return {"decision": "空仓", "reason": "审计保险触发：连续同类否定理由 → 空仓",
-                    "rounds": rnd, "audit": verdict, "audit_history": rejected,
+                    "rounds": consumed, "audit": verdict, "audit_history": rejected,
+                    "p1_etf_inserts": chosen,
                     "code": "", "name": "", "industry": "", "tier_basis": []}
         history.append(gap)
         rejected.append(verdict)
         prev = plan
-    return {"decision": "空仓", "reason": "3 轮审计均不认可 → 空仓",
-            "rounds": 3, "audit": rejected[-1] if rejected else {}, "audit_history": rejected,
-            "code": "", "name": "", "industry": "", "tier_basis": []}
 
+        # --- P1 闸门：否决理由涉及 P1 时，插入一次 ETF（消耗一轮）-------------
+        if (etf_hook is not None and inserts < _MAX_ETF_INSERTS
+                and consumed < 3 and _gap_touches_p1(verdict, plan)):
+            consumed += 1                        # ETF 插入也消耗一轮
+            try:
+                sub_system, sub_pool, sub_ev, sub_per, _ = etf_hook()
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"P1 插入 ETF 失败（{type(e).__name__}: {e}），跳过本次插入")
+                prev = None
+                continue
+            if not sub_pool.candidates_text(top).strip():
+                errors.append("P1 插入 ETF 失败：所选行业在 ETF 池中无候选标的，跳过本次插入")
+                prev = None
+                continue
+            res2 = ctx.llm.call("agent62", sub_system,
+                                f"【精选证据】\n{sub_ev}\n\n【外围（外盘指数 + 外围消息原文）】\n"
+                                f"{sub_per}\n\n入选的 5 个行业：{'、'.join(top)}",
+                                tag=f"agent62:p1insert{consumed}")
+            try:
+                etf_plan = res2.json()
+            except ValueError:
+                etf_plan = {"decision": "空仓",
+                            "reason": f"ETF 输出无法解析：{res2.error or '格式错误'}"}
+            if etf_plan.get("decision") == "买入":
+                it = sub_pool.find(etf_plan.get("code") or "") or sub_pool.find(etf_plan.get("name") or "")
+                etf_plan = ({**etf_plan, "code": it.code, "name": it.name} if it
+                            else {**etf_plan, "decision": "空仓", "_invalid": True,
+                                  "reason": "所推举 ETF 不在候选池内 → 空仓"})
+            v2 = _audit(ctx, etf_plan, consumed, schema, history)
+            chosen.append({"round": consumed, "plan": etf_plan, "audit": v2})
+            inserts += 1
+            if v2.get("verdict") == "认可":
+                return {**etf_plan, "rounds": consumed, "audit": v2,
+                        "audit_history": rejected, "p1_etf_inserts": chosen}
+            # ETF 也被否 → 回股票层，用剩余轮数
+            history.append(v2.get("gap_type") or "证据缺失")
+            rejected.append(v2)
+            prev = None
+            continue
+        prev = plan
+    return {"decision": "空仓", "reason": "3 轮审计均不认可 → 空仓",
+            "rounds": consumed, "audit": rejected[-1] if rejected else {},
+            "audit_history": rejected, "p1_etf_inserts": chosen,
+            "code": "", "name": "", "industry": "", "tier_basis": []}
 
 # --------------------------------------------------------------------------
 # 主入口：唯一预测接口（原则二）
@@ -730,6 +1017,10 @@ def predict(date: str, *, refresh: bool = False, use_cache: bool = True,
         decision = Decision(date=date, action="空仓", reason="当日无任何行业有快讯归属 → 空仓")
         ctx.save("analysis/agent6_decision.json", decision.to_dict())
     else:
+        # 股票层走 Agent52 + 第4关（消息→个股归属，剔除「其他」）；
+        # ETF 层不经过这两步，Agent62 直读 Agent5 的行业级精选。
+        mapping = stage_agent52(ctx, None, top)
+        stage_f4(ctx, mapping, top)
         stock = stage_agent6(ctx, selected, top, per, per_note)
         ctx.save("analysis/agent6_decision.json", stock)
         if stock.get("decision") == "买入":
@@ -788,6 +1079,66 @@ def _md_agent3(items: list[dict]) -> str:
     for n in items:
         lines.append(f"- `{n['code']}` **{n['industry']}**"
                      f"{'/' + n['industry2'] if n.get('industry2') else ''} ｜ {n['title']}")
+    return "\n".join(lines)
+
+
+def _evidence_by_stock(ctx: Ctx, mapping: dict, top: list[str]) -> str:
+    """把 hard_filter_4 之后的证据按【每股一束】重排，并补一行【行业视图】。
+
+    行业视图只陈述"本行业有几条标的级证据、分别指向哪只股"这个事实，
+    不引入任何消息文本之外的信息（不构成未来数据泄露）。
+    它的作用是让 Agent6 看得到"同行业多条同向"，而不是只看每股 1 条就断言凑不齐。
+    """
+    by_code = {n["code"]: n for n in ctx.load("analysis/agent42_tiers.json")}
+    lines = []
+    for name in top:
+        blk = mapping.get(name, {})
+        per_stock: dict[str, list[dict]] = {}
+        for m in blk.get("maps", []):
+            n = by_code.get(m["code"])
+            if not n:
+                continue
+            for s in m["stocks"]:
+                per_stock.setdefault(s, []).append({**n, "map_why": m.get("why", "")})
+        lines.append(f"\n{'=' * 62}")
+        if not per_stock:
+            lines.append(f"行业：{name}｜标的级证据 0 条（无一条精选消息能归属到候选股）→ "
+                         f"本行业【无标的级证据】，不得开仓")
+            continue
+        tot = sum(len(v) for v in per_stock.values())
+        lines.append(f"行业：{name}｜标的级证据 {tot} 条，分布在 {len(per_stock)} 只候选股上")
+        for code, items in per_stock.items():
+            it = ctx.stocks.find(code)
+            tiers = "/".join(n["tier"] for n in sorted(items, key=_rank_key))
+            lines.append(f"  · {code} {it.name if it else ''}：{len(items)} 条（{tiers}）")
+        lines.append(f"  （注：弱档合成要求【同一个标的】名下有 ≥5 条来自独立事件的同向弱档；"
+                     f"跨标的的弱档不能相加）")
+        for code, items in per_stock.items():
+            it = ctx.stocks.find(code)
+            lines.append(f"\n  候选股 {code} {it.name if it else ''}（{len(items)} 条）：")
+            for n in sorted(items, key=_rank_key):
+                lines.append(f"    - [{n['tier']}] {n['title']}")
+                lines.append(f"      摘要：{n['summary']}（code={n['code']}）")
+                if n.get("map_why"):
+                    lines.append(f"      归属理由：{n['map_why']}")
+    return "\n".join(lines)
+
+
+def _md_agent52(result: dict, by_code: dict, top: list[str]) -> str:
+    lines = ["# Agent52 消息→个股归属", ""]
+    for name in top:
+        blk = result.get(name, {})
+        lines.append(f"## {name}（映射 {len(blk.get('maps', []))} 条，其他 {len(blk.get('other', []))} 条）")
+        for m in blk.get("maps", []):
+            n = by_code.get(m["code"], {})
+            names = "、".join(f"{s}" for s in m["stocks"])
+            lines.append(f"- [{n.get('tier', '')}] {n.get('title', '')}  →  **{names}**")
+            if m.get("why"):
+                lines.append(f"  - {m['why']}")
+        for c in blk.get("other", []):
+            n = by_code.get(c, {})
+            lines.append(f"- [{n.get('tier', '')}] {n.get('title', '')}  →  **其他（无候选股）**")
+        lines.append("")
     return "\n".join(lines)
 
 

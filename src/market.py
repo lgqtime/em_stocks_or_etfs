@@ -24,6 +24,9 @@ import re
 from .http import Client
 
 TX_KLINE = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+# 同一台服务器的备用入口：web. 前缀那个会被腾讯 WAF 判定（整域名连续 501，当天不恢复），
+# 不带前缀的入口实测可用，且返回的日线数据与主入口【逐字段一致】（4 个标的实测相同）。
+TX_KLINE_ALT = "https://ifzq.gtimg.cn/appstock/app/fqkline/get"
 SINA_KLINE = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
               "CN_MarketData.getKLineData")
 SH_INDEX = "sh000001"          # 上证指数，用作交易日历
@@ -40,15 +43,23 @@ def symbol(code: str, kind: str = "stock") -> str:
     return ("sh" if code.startswith(("5", "6", "9")) else "sz") + code
 
 
-# --- 源一：腾讯 -------------------------------------------------------------
+# --- 源一：腾讯（两个入口同构，逐个回落）------------------------------------
 def _tencent(client: Client, sym: str, beg: str, end: str) -> list[dict]:
-    j = client.get_json(TX_KLINE, params={"param": f"{sym},day,{beg},{end},800,qfq"})
-    node = (j.get("data") or {}).get(sym) or {}
-    rows = node.get("qfqday") or node.get("day") or []
-    out = [{"date": p[0], "open": float(p[1]), "close": float(p[2]),
-            "high": float(p[3]), "low": float(p[4]),
-            "volume": float(p[5]) if len(p) > 5 and p[5] else 0.0} for p in rows]
-    return out
+    last = None
+    for url in (TX_KLINE, TX_KLINE_ALT):
+        try:
+            j = client.get_json(url, params={"param": f"{sym},day,{beg},{end},800,qfq"})
+        except Exception as e:  # noqa: BLE001 - 逐入口回落
+            last = f"{url.split('/')[2]}: {type(e).__name__}"
+            continue
+        node = (j.get("data") or {}).get(sym) or {}
+        rows = node.get("qfqday") or node.get("day") or []
+        if rows:
+            return [{"date": p[0], "open": float(p[1]), "close": float(p[2]),
+                     "high": float(p[3]), "low": float(p[4]),
+                     "volume": float(p[5]) if len(p) > 5 and p[5] else 0.0} for p in rows]
+        last = f"{url.split('/')[2]}: 无 day 数据"
+    raise RuntimeError(f"腾讯日线取不到（{last}）")
 
 
 # --- 源二：新浪 -------------------------------------------------------------

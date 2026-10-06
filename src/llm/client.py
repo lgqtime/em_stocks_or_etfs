@@ -29,6 +29,7 @@ MODELS: dict[str, tuple[str, str, str | None]] = {
     "agent4":  ("deepseek-v4-pro", "enabled",  "high"),
     "agent42": ("deepseek-v4-pro", "enabled",  "high"),
     "agent5":  ("deepseek-v4-pro", "enabled",  "low"),
+    "agent52": ("deepseek-v4-pro", "enabled",  "high"),
     "agent6":  ("deepseek-v4-pro", "enabled",  "max"),
     "agent62": ("deepseek-v4-pro", "enabled",  "max"),
     "audit":   ("deepseek-v4-pro", "enabled",  "max"),
@@ -39,13 +40,13 @@ _JSON = re.compile(r"\{.*\}", re.S)
 # 不缓存的 Agent：决策与审计单次结果本就带模型随机，
 # 缓存会把"第一次碰巧算出的那个结论"冻结成唯一答案（方案 §10.1 第 5 条：
 # 单次运行的结果不能用来比较版本）。批量提取类（agent1/2/3/4/42/5）才缓存。
-NO_CACHE = {"agent6", "agent62", "audit"}
+NO_CACHE = {"agent52", "agent6", "agent62", "audit"}
 
 # 固定 temperature=0 的 Agent：把采样随机性从决策路径上掐掉。
 # 实测（09-10 跑 4 次得 3 个不同标的、审计对同一条证据两次结论相反）表明
 # 决策层的摆动主要来自采样。注意：temperature=0 **不等于**确定性输出，
 # 只消除采样这一个来源；审计判据本身的弹性要靠 tier_rules 的硬判据约束。
-GREEDY = {"agent6", "agent62", "audit"}
+GREEDY = {"agent52", "agent6", "agent62", "audit"}
 
 
 @dataclasses.dataclass

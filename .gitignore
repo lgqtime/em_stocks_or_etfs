@@ -9,8 +9,8 @@ __pycache__/
 *.pyc
 .venv/
 
-# 临时探针脚本
-_probe*.py
+# 临时探针脚本：一次性诊断用，不属于项目运行所需模块
+_*.py
 _probe*.json
 _probe*.txt
 _*.log

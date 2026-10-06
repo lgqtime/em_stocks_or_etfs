@@ -1,8 +1,14 @@
-"""把每个 Agent 实际发出的提示词渲染出来（含 system + 一条真实 user 样例）。"""
+"""把每个 Agent 实际发出的提示词渲染出来（含 system + 一条真实 user 样例）。
+
+用法：`python showprompts.py > PROMPTS.md`
+注意 stdout 必须设置 newline="\n" —— 否则 Windows 会把换行翻译成 CRLF，
+而 .gitattributes 规定 *.md 用 LF，结果是每次生成都产生整文件 diff。
+"""
 
 import sys
 
-sys.stdout.reconfigure(encoding="utf-8")
+# newline="\n" 是必须的（见上）；encoding 固定 utf-8 以匹配仓库约定。
+sys.stdout.reconfigure(encoding="utf-8", newline="\n")
 
 from src import configs
 from src.llm import prompts as P
@@ -60,6 +66,11 @@ AGENTS = [
     ("第3关后 Agent5 证据复审", "agent5", P.agent5(),
      "\n".join(f"- code={n['code']} 档位={n['tier']} {n['title']}\n  摘要：{n['summary']}"
                for n in WORK)),
+    ("第4关前 Agent52 消息→个股归属", "agent52",
+     P.agent52("电子", stocks.candidates_text(["电子"])),
+     "为下列精选摘要指出它指向哪只候选股票：\n"
+     + "\n".join(f"[{i}] code={n['code']} [{n['tier']}] {n['title']}\n    摘要：{n['summary']}"
+                 for i, n in enumerate(WORK))),
     ("Agent6 选股", "agent6", P.agent6(stocks.candidates_text(TOPN)),
      "【精选证据】\n（此处为 Agent5 的精选结果 + 外围原文，略）\n\n"
      f"入选的 5 个行业：{'、'.join(TOPN)}"),
@@ -71,14 +82,38 @@ AGENTS = [
      '{"decision": "买入", "code": "002008", "name": "大族激光", "industry": "机械设备", …}'),
 ]
 
-for name, key, system, user in AGENTS:
-    model, thinking, effort = MODELS[key]
-    print("\n" + "#" * 78)
-    print(f"# {name}")
-    print(f"# 模型={model}  thinking={thinking}  effort={effort or '—'}"
-          f"  system {len(system)} 字 / user 样例 {len(user)} 字")
-    print("#" * 78)
-    print("---------- SYSTEM ----------")
-    print(system)
-    print("---------- USER（样例） ----------")
-    print(user)
+def render() -> str:
+    """渲染成 Markdown 文本。"""
+    out = []
+    for name, key, system, user in AGENTS:
+        model, thinking, effort = MODELS[key]
+        out.append("#" * 78)
+        out.append(f"# {name}")
+        out.append(f"# 模型={model}  thinking={thinking}  effort={effort or '—'}"
+                   f"  system {len(system)} 字 / user 样例 {len(user)} 字")
+        out.append("#" * 78)
+        out.append("---------- SYSTEM ----------")
+        out.append(system)
+        out.append("---------- USER（样例） ----------")
+        out.append(user)
+    return "\n\n".join(out) + "\n"
+
+
+if __name__ == "__main__":
+    # 【默认写文件，而不是打到 stdout】原因：PowerShell 的 `>` 重定向会由 PowerShell
+    # 自己以 UTF-16LE 写文件（含 BOM），Python 侧怎么设置都没用 —— 结果 PROMPTS.md
+    # 变成二进制、每次生成都整文件 diff。所以这里直接写文件，杜绝那个坑。
+    import argparse
+    from pathlib import Path
+
+    ap = argparse.ArgumentParser(description="渲染各 Agent 的提示词")
+    ap.add_argument("--out", default="PROMPTS.md", help="输出文件（默认 PROMPTS.md）")
+    ap.add_argument("--stdout", action="store_true",
+                    help="打到标准输出（仅在确定终端能正确处理 UTF-8 时用）")
+    a = ap.parse_args()
+    text = render()
+    if a.stdout:
+        sys.stdout.write(text)
+    else:
+        Path(a.out).write_text(text, encoding="utf-8", newline="\n")
+        print(f"已生成 {a.out}（{len(text)} 字符，UTF-8 / LF）")

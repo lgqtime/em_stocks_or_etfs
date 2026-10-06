@@ -136,16 +136,34 @@ check("上证指数日历", lambda: f"{len(market.trading_days(c, beg, end))} �
 
 
 def _source_check():
-    """两个源分别单独验一遍——只测串联链会漏掉"备用源其实也挂了"。"""
+    """逐【入口】分别探，而不是逐源函数 —— 主入口被 WAF 拦时，
+    `_tencent` 会静默回落到备用入口并成功，于是逐源的检查会报绿，
+    把"主入口已死"这件事藏起来。逐入口探才能看见真实状态。"""
     import src.market as m
-    out = []
-    for name, fn in m.SOURCES:
+
+    def probe(name, fn):
         try:
             rows = fn(c, "sz002594", beg, end)
-            out.append(f"{name}={len(rows)}")
+            return f"{name}={len(rows)}"
         except Exception as e:  # noqa: BLE001
-            out.append(f"{name}=FAIL({type(e).__name__})")
-    return "  ".join(out)
+            return f"{name}=FAIL({type(e).__name__})"
+
+    def tx_host(url):
+        def _f(client, sym, b, e):
+            j = client.get_json(url, params={"param": f"{sym},day,{b},{e},800,qfq"})
+            node = (j.get("data") or {}).get(sym) or {}
+            rows = node.get("qfqday") or node.get("day") or []
+            if not rows:
+                raise RuntimeError("无 day 数据")
+            return rows
+        return _f
+
+    parts = [
+        probe("腾讯主", tx_host(m.TX_KLINE)),        # web. 前缀，易被 WAF 拦
+        probe("腾讯备", tx_host(m.TX_KLINE_ALT)),    # 不带前缀，实测更稳
+        probe("新浪", m._sina),
+    ]
+    return "  ".join(parts)
 
 
 check("双源分别可用性", _source_check)
