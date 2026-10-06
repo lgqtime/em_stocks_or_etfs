@@ -814,20 +814,46 @@ def stage_agent6(ctx: Ctx, upstream, top: list[str], per: list[dict],
         return (P.agent62(etf_pool.candidates_text(only)), etf_pool,
                 etf_evidence, etf_periphery, None)
 
-    return _decide(ctx, "agent6", P.agent6(cand), pool, evidence, periphery, top,
-                   etf_hook=_etf_hook)
+    # tier_items 必须传：闸门（一）靠它检测"模型自己否掉 / 跳过 P1"
+    tier_items = [n for n in ctx.load("analysis/agent42_tiers.json")
+                  if n.get("industry") != hard.PERIPHERY_INDUSTRY]
+    out = _decide(ctx, "agent6", P.agent6(cand), pool, evidence, periphery, top,
+                  etf_hook=_etf_hook, tier_items=tier_items)
+    # ETF 环节预算是【全局】的：阶段1 的 P1 插入与阶段2 的轮数合计 ≤ ETF_TOTAL_BUDGET。
+    # 这里把用量随结果带出去，供阶段2 计算剩余轮数。
+    out["etf_budget"] = ETF_TOTAL_BUDGET
+    out["etf_used"] = int(out.get("etf_used") or 0)
+    return out
 
 
-def stage_agent62(ctx: Ctx, upstream, top: list[str], per: list[dict], per_note: str) -> dict:
+def stage_agent62(ctx: Ctx, upstream, top: list[str], per: list[dict], per_note: str,
+                  *, etf_used: int = 0) -> dict:
+    """阶段2：正式 ETF 环节。
+
+    轮数 = ETF_TOTAL_BUDGET − 阶段1 已用（P1 插入占的额度）。
+    预算耗尽（<=0）就不跑 —— 说明 ETF 环节的 3 次机会在阶段1 用完了。
+    """
+    remaining = ETF_TOTAL_BUDGET - int(etf_used or 0)
+    if remaining <= 0:
+        return {"decision": "空仓",
+                "reason": f"ETF 环节预算已用尽（{etf_used}/{ETF_TOTAL_BUDGET}），"
+                          f"阶段2 不再调用 agent62",
+                "code": "", "name": "", "industry": "", "tier_basis": [],
+                "rounds": 0, "etf_used": etf_used, "etf_budget": ETF_TOTAL_BUDGET}
     selected = ctx.stage_input("agent62", upstream,
                                lambda: ctx.load("analysis/agent5_selected.json"))
     pool = ctx.etfs
     cand = pool.candidates_text(top)
     if not cand.strip():
         return {"decision": "空仓", "reason": "所选行业在 ETF 池中无候选标的", "code": "",
-                "name": "", "industry": "", "tier_basis": [], "rounds": 0}
+                "name": "", "industry": "", "tier_basis": [], "rounds": 0,
+                "etf_used": etf_used, "etf_budget": ETF_TOTAL_BUDGET}
     evidence, periphery = _ctx_parts(ctx, selected, top, per_note)
-    return _decide(ctx, "agent62", P.agent62(cand), pool, evidence, periphery, top)
+    out = _decide(ctx, "agent62", P.agent62(cand), pool, evidence, periphery, top,
+                  max_rounds=remaining)
+    out["etf_used"] = int(etf_used or 0) + int(out.get("etf_used") or 0)
+    out["etf_budget"] = ETF_TOTAL_BUDGET
+    return out
 
 
 def _evidence_text(selected: list[dict], top: list[str]) -> str:
@@ -877,22 +903,90 @@ def _gap_touches_p1(verdict: dict, plan: dict) -> bool:
     return (verdict.get("gap_type") or "") in _P_GAP_TYPES
 
 
-_MAX_ETF_INSERTS = 1          # 用户定案：P1 被否后只插一次 ETF
+# ETF 环节的【全局】预算：阶段1 的 P1 插入 + 阶段2 的轮数，合计不超过 3。
+ETF_TOTAL_BUDGET = 3
+# 阶段1 插入上限：留 ≥1 轮给阶段2。阶段1 每轮至多插一次，
+# 而每轮都消费 1 次股票调用，所以插入次数天然 ≤ 3。
+_MAX_P1_INSERT = 2
+
+
+def _p1_industry_of_self_reject(plan: dict, tier_items: list[dict]) -> str:
+    """【模型自己否掉 / 跳过 P1】的检测（路线 2）。
+
+    判据：证据池里【存在 P1 候选】，而本轮提案【不是以 P1 为依据】的
+          —— 说明模型跳过了 P1（无论它明说否掉，还是直接选了别的档位）。
+    返回被跳过的那个 P1 所在行业；检测不到返回空串。
+    """
+    p1_items = [n for n in tier_items if (n.get("tier") or "").strip() == "P1"]
+    if not p1_items:
+        return ""
+    basis = " ".join(str(x) for x in (plan.get("tier_basis") or []))
+    if "P1" in basis:                       # 本轮提案就是 P1，不算跳过
+        return ""
+    return (p1_items[0].get("industry") or "").strip()
+
+
+def _p1_etf_respond(ctx: Ctx, etf_hook, industry: str, tag_r: int, schema: str,
+                    history: list[str]):
+    """P1 被否后，用【同行业 ETF】回应一次。
+
+    返回 (etf_plan, verdict)。etf_plan 为 None 表示本次插入被跳过
+    （无行业 / 该行业在 ETF 池无候选 / 调用失败）。
+    """
+    ind = (industry or "").strip()
+    if not ind:
+        errors.append("P1 插入 ETF 跳过：无法定位被否 P1 所在行业")
+        return None, None
+    try:
+        sub_system, sub_pool, sub_ev, sub_per, _ = etf_hook(ind)
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"P1 插入 ETF 失败（{type(e).__name__}: {e}）")
+        return None, None
+    if not sub_pool.candidates_text([ind]).strip():
+        errors.append(f"P1 插入 ETF 跳过：行业「{ind}」在 ETF 池中无候选标的")
+        return None, None
+    # 【不携带被否方案与被否理由】—— 这是一次独立的 ETF 环节调用，
+    # 只告诉它"本次只评估这一个行业"，否则模型会把被否的理由直接搬过来。
+    res2 = ctx.llm.call(
+        "agent62", sub_system,
+        f"【精选证据】\n{sub_ev}\n\n【外围（外盘指数 + 外围消息原文）】\n{sub_per}\n\n"
+        f"本次只评估一个行业：{ind}",
+        tag=f"agent62:p1insert{tag_r}")
+    try:
+        etf_plan = res2.json()
+    except ValueError:
+        etf_plan = {"decision": "空仓", "reason": f"ETF 输出无法解析：{res2.error or '格式错误'}"}
+    if etf_plan.get("decision") == "买入":
+        it = sub_pool.find(etf_plan.get("code") or "") or sub_pool.find(etf_plan.get("name") or "")
+        etf_plan = ({**etf_plan, "code": it.code, "name": it.name} if it
+                    else {**etf_plan, "decision": "空仓", "_invalid": True,
+                          "reason": "所推举 ETF 不在候选池内 → 空仓"})
+    return etf_plan, _audit(ctx, etf_plan, tag_r, schema, history)
+
 
 
 def _decide(ctx: Ctx, agent: str, system: str, pool: Pool,
             evidence: str, periphery: str, top: list[str], *,
-            etf_hook=None) -> dict:
-    """决策 + 审计回退（最多 3 轮）。3 轮仍不认可 → 空仓。
+            etf_hook=None, tier_items: list[dict] | None = None,
+            max_rounds: int = 3) -> dict:
+    """决策 + 审计回退（最多 max_rounds 轮）。轮次耗尽仍不认可 → 空仓。
 
-    etf_hook（仅股票层用）：审计【不认可且理由涉及 P1】时，插入【一次】ETF 回应。
-      · 【只插一次】（inserts 上限 1），且【不消耗股票轮次】
-      · 【只认被否股票所在的那个行业】—— 用同行业的行业级 ETF，回应"P1 强档股票被否"
-      · ETF 插入也只审一次；不被认可以后回股票层走【正常流程】（r2/r3）
-      · 阶段2 的 ETF 层（stage_agent62）不走这个 hook，维持原样
+    etf_hook（仅股票层用）：**只要 P1 被否**，就用【同行业 ETF】回应【一次】。
+      触发条件（两条都算 —— 用户定案"无论哪个 agent 否的"）：
+        (1) 【模型自己】否掉 / 跳过 P1 —— 池内存在 P1 候选，但本轮提案不是 P1
+            （必须在【审计之前】检测：否则审计会认可那个非 P1 方案，流程直接结束）
+        (2) 【审计】不认可且理由涉及 P1
+      · 【不消耗股票轮次】，但【占用 ETF 环节的全局预算】（见 ETF_TOTAL_BUDGET）
+      · 阶段1 最多插 _MAX_P1_INSERT 次
+      · 【只认被否 P1 所在的那个行业】
+      · 插入的 ETF 也只审一次；不被认可以后回股票层走【正常流程】
+      · 阶段2 的 ETF 层（stage_agent62）不带 hook，但用剩余预算决定轮数
 
+    tier_items：带档位的证据条目（用于检测"模型跳过了哪个 P1"）。
+    返回里带 etf_used / etf_budget，供阶段2 计算剩余轮数。
     hook 签名：hook(industry: str) -> (system, pool, evidence, periphery, _)
     """
+    tier_items = tier_items or []
     schema = (f"【精选证据】\n{evidence}\n\n【外围（外盘指数 + 外围消息原文）】\n{periphery}\n\n"
               f"入选的 5 个行业：{'、'.join(top)}")
     history: list[str] = []
@@ -901,7 +995,23 @@ def _decide(ctx: Ctx, agent: str, system: str, pool: Pool,
     prev = None
     inserts = 0
     consumed = 0                     # 已消耗的【股票】轮数（ETF 插入不计入）
-    while consumed < 3:
+
+    def _flush_etf(reason_tag: str, industry: str, tag_r: int):
+        """插入一次 ETF 并处理结论。返回 (是否已定局, 结果dict)。"""
+        etf_plan, v2 = _p1_etf_respond(ctx, etf_hook, industry, tag_r, schema, history)
+        if etf_plan is None:
+            return False, None
+        chosen.append({"trigger": reason_tag, "round": tag_r,
+                       "industry": industry, "plan": etf_plan, "audit": v2})
+        if (v2 or {}).get("verdict") == "认可":
+            return True, {**etf_plan, "rounds": consumed, "audit": v2,
+                          "audit_history": rejected, "p1_etf_inserts": chosen,
+                          "etf_used": inserts}
+        history.append((v2 or {}).get("gap_type") or "证据缺失")
+        rejected.append(v2 or {})
+        return False, None
+
+    while consumed < max_rounds:
         consumed += 1                                # 本轮（股票尝试）消耗一轮
         tag_r = consumed
         if prev is None:
@@ -930,10 +1040,22 @@ def _decide(ctx: Ctx, agent: str, system: str, pool: Pool,
             else:
                 plan = {**plan, "code": item.code, "name": item.name}
 
+        # --- P1 闸门（一）：模型自己否掉 / 跳过 P1（必须在审计之前检测）---------
+        if etf_hook is not None and inserts < _MAX_P1_INSERT and tier_items:
+            ind_self = _p1_industry_of_self_reject(plan, tier_items)
+            if ind_self:
+                inserts += 1                      # 【不】动 consumed
+                done, out = _flush_etf("模型自否/跳过 P1", ind_self, tag_r)
+                if done:
+                    return out
+                prev = None
+                continue
+
         verdict = _audit(ctx, plan, tag_r, schema, history)
         if verdict.get("verdict") == "认可":
-            return {**plan, "rounds": consumed, "audit": verdict, "audit_history": rejected,
-                    "p1_etf_inserts": chosen}
+            return {**plan, "rounds": consumed, "audit": verdict,
+                    "audit_history": rejected, "p1_etf_inserts": chosen,
+                    "etf_used": inserts}
         gap = verdict.get("gap_type") or "证据缺失"
         if gap in history:                       # 保险：每轮 gap_type 必须不同
             verdict = {**verdict, "gap_type": gap,
@@ -941,68 +1063,30 @@ def _decide(ctx: Ctx, agent: str, system: str, pool: Pool,
             rejected.append(verdict)
             return {"decision": "空仓", "reason": "审计保险触发：连续同类否定理由 → 空仓",
                     "rounds": consumed, "audit": verdict, "audit_history": rejected,
-                    "p1_etf_inserts": chosen,
+                    "p1_etf_inserts": chosen, "etf_used": inserts,
                     "code": "", "name": "", "industry": "", "tier_basis": []}
         history.append(gap)
         rejected.append(verdict)
         prev = plan
 
-        # --- P1 闸门：否决理由涉及 P1 时，用【同行业 ETF】回应一次 -------------
-        # 用户定案：P1 强档股票被否 → 优先以【该股票所在行业】的 ETF 回应，再判决。
-        #   · 只插一次（_MAX_ETF_INSERTS=1）
-        #   · 【不消耗股票轮次】—— 独立预算，插完仍回股票层走正常流程（r2/r3）
-        #   · 插入的 ETF 只看被否股票所在行业（(a) 口径）
-        if (etf_hook is not None and inserts < _MAX_ETF_INSERTS
+        # --- P1 闸门（二）：审计否掉了以 P1 为依据的方案 ------------------------
+        if (etf_hook is not None and inserts < _MAX_P1_INSERT
                 and _gap_touches_p1(verdict, plan)):
-            ind = (plan.get("industry") or "").strip()
-            if not ind:
-                errors.append("P1 注入 ETF 跳过：被否方案未给出行业，无法定位同行业 ETF")
-            else:
-                inserts += 1                      # 只插一次；【不】动 consumed
-                try:
-                    sub_system, sub_pool, sub_ev, sub_per, _ = etf_hook(ind)
-                except Exception as e:  # noqa: BLE001
-                    errors.append(f"P1 插入 ETF 失败（{type(e).__name__}: {e}）")
-                    sub_pool = None
-                if sub_pool is not None:
-                    if not sub_pool.candidates_text([ind]).strip():
-                        errors.append(f"P1 插入 ETF 跳过：行业「{ind}」在 ETF 池中无候选标的")
-                    else:
-                        res2 = ctx.llm.call(
-                            "agent62", sub_system,
-                            f"【精选证据】\n{sub_ev}\n\n【外围（外盘指数 + 外围消息原文）】\n"
-                            f"{sub_per}\n\n"
-                            f"本次只回应一个行业：{ind}（其 P1 强档股票方案被审计否决，"
-                            f"改由该行业的 ETF 承接，请据此判决）",
-                            tag=f"agent62:p1insert{tag_r}")
-                        try:
-                            etf_plan = res2.json()
-                        except ValueError:
-                            etf_plan = {"decision": "空仓",
-                                        "reason": f"ETF 输出无法解析：{res2.error or '格式错误'}"}
-                        if etf_plan.get("decision") == "买入":
-                            it = (sub_pool.find(etf_plan.get("code") or "")
-                                  or sub_pool.find(etf_plan.get("name") or ""))
-                            etf_plan = ({**etf_plan, "code": it.code, "name": it.name} if it
-                                        else {**etf_plan, "decision": "空仓", "_invalid": True,
-                                              "reason": "所推举 ETF 不在候选池内 → 空仓"})
-                        v2 = _audit(ctx, etf_plan, tag_r, schema, history)
-                        chosen.append({"round": tag_r, "industry": ind,
-                                       "plan": etf_plan, "audit": v2})
-                        if v2.get("verdict") == "认可":
-                            return {**etf_plan, "rounds": consumed, "audit": v2,
-                                    "audit_history": rejected, "p1_etf_inserts": chosen}
-                        # ETF 也被否 → 回股票层走【正常流程】
-                        history.append(v2.get("gap_type") or "证据缺失")
-                        rejected.append(v2)
+            ind_audit = (plan.get("industry") or "").strip()
+            if not ind_audit and tier_items:
+                ind_audit = _p1_industry_of_self_reject({}, tier_items)
+            inserts += 1                          # 【不】动 consumed
+            done, out = _flush_etf("审计否 P1", ind_audit, tag_r)
+            if done:
+                return out
             prev = None
             continue
-        prev = plan
-        prev = plan
-    return {"decision": "空仓", "reason": "3 轮审计均不认可 → 空仓",
+    return {"decision": "空仓", "reason": f"{max_rounds} 轮审计均不认可 → 空仓",
             "rounds": consumed, "audit": rejected[-1] if rejected else {},
             "audit_history": rejected, "p1_etf_inserts": chosen,
+            "etf_used": inserts,
             "code": "", "name": "", "industry": "", "tier_basis": []}
+
 
 # --------------------------------------------------------------------------
 # 主入口：唯一预测接口（原则二）
@@ -1039,6 +1123,8 @@ def predict(date: str, *, refresh: bool = False, use_cache: bool = True,
         mapping = stage_agent52(ctx, None, top)
         stage_f4(ctx, mapping, top)
         stock = stage_agent6(ctx, selected, top, per, per_note)
+        # 把阶段1 用掉的 ETF 预算传给阶段2（全局 3 次）
+        _etf_used_stock = int(stock.get("etf_used") or 0)
         ctx.save("analysis/agent6_decision.json", stock)
         if stock.get("decision") == "买入":
             decision = Decision(date=date, action="买入", kind="stock",
@@ -1048,7 +1134,8 @@ def predict(date: str, *, refresh: bool = False, use_cache: bool = True,
                                 reason=stock.get("reason", ""),
                                 audit_rounds=stock.get("rounds", 0))
         else:
-            etf = stage_agent62(ctx, selected, top, per, per_note)
+            etf = stage_agent62(ctx, selected, top, per, per_note,
+                                etf_used=_etf_used_stock)
             ctx.save("analysis/agent62_decision.json", etf)
             decision = Decision(
                 date=date,

@@ -143,8 +143,16 @@ _live = __import__("src.collect.quotes", fromlist=["collect_quotes"]).collect_qu
 assert set(_q[0]) >= set(_live[0]), "历史源必须与实时源输出同构（下游才能不改）"
 
 # --- ③ 决策层固定 temperature=0 ---------------------------------------------
+# GREEDY（固定 temperature=0）与 NO_CACHE（不读缓存）是【两个不同概念】，
+# 不要再用相等断言绑在一起：agent52 该有 GREEDY（映射要稳），
+# 但它是批量提取类，【该缓存】，不应在 NO_CACHE。
 from src.llm.client import GREEDY, NO_CACHE
-assert GREEDY == NO_CACHE == {"agent52", "agent6", "agent62", "audit"}, (GREEDY, NO_CACHE)
+assert GREEDY == {"agent52", "agent6", "agent62", "audit"}, GREEDY
+assert NO_CACHE == {"agent6", "agent62", "audit"}, NO_CACHE
+assert "agent52" in GREEDY and "agent52" not in NO_CACHE, \
+    "agent52 应固定 temperature=0，但不应被排除出缓存（批量提取类）"
+for _dec in ("agent6", "agent62", "audit"):
+    assert _dec in GREEDY and _dec in NO_CACHE, f"{_dec} 是决策/审计，应同时 GREEDY 且不缓存"
 assert "agent4" not in GREEDY and "agent1" not in GREEDY, "批量提取层不应固定 temperature"
 
 # --- E 档四步流水线（合并了"已兑现降档"与"渠道判据"两节）------------------
@@ -292,6 +300,27 @@ assert "主体不在池 否决它" in _a_txt, "审计缺『不得用主体不在
 assert "量级不足以驱动标的" in _a_txt, "审计未保留『量级不足』这一正当否决理由"
 assert "P 档已生效不是" in _a_txt, "审计 gap_type 说明未标注 P 档豁免"
 assert "P 档复核要点" in P.agent42(), "Agent42 缺 P 档复核要点"
+
+# --- Agent42【不得移除任何消息】（用户定案：本条保持不变）----------------------
+# 曾经加过"删除权"（规则甲：回顾过去日期 / 规则乙：涨价上涨），用户已取消。
+# 这里反向锁住：不得再出现任何删除规则或 remove 字段。
+_a42 = P.agent42()
+assert "不得移除任何消息" in _a42, "Agent42 缺『不得移除任何消息』"
+assert "你可以调整它的【方向】标签；且【不得移除】它" in _a42, \
+    "外围消息缺『不得移除』"
+for _bad in ("删除规则甲", "删除规则乙", "你有删除权", "remove_rule", "\"remove\":"):
+    assert _bad not in _a42, f"Agent42 残留删除权残留：{_bad}"
+_a42src = _read_or_empty("src/pipeline.py")
+for _bad in ('rec.get("remove")', "_apply_agent42", "Agent42删除"):
+    assert _bad not in _a42src, f"pipeline 残留删除权实现：{_bad}"
+# 审查层仍必须写 a42_removed: False 这个恒假标记（表示"没有移除"）
+assert '"a42_removed": False' in _a42src, "缺 a42_removed 恒假标记"
+
+# agent52 已移出 NO_CACHE（批量提取类应缓存），决策类仍不缓存
+from src.llm import client as _client  # noqa: E402
+assert "agent52" not in _client.NO_CACHE, "agent52 应可缓存（批量提取类）"
+for _a in ("agent6", "agent62", "audit"):
+    assert _a in _client.NO_CACHE, f"{_a} 是决策/审计，必须保持不缓存"
 assert "已生效/已落地" in P.retry("g", "d", "m", "p"), "回退提示词缺 P 档保护"
 _pp = configs.load_tier_rules()["judging_rules"].get("p_tier_protection")
 assert _pp and len(_pp["allowed_rejection_reasons"]) == 3, "配置缺 p_tier_protection"
@@ -394,26 +423,32 @@ _stocks, _etfs = _cfg.load_stocks(), _cfg.load_etfs()
 
 
 def _hook(industry: str):
-    """hook 现在收行业参数 —— 只回应被否股票所在行业。"""
+    """hook 收行业参数 —— 只回应被否 P1 所在行业。"""
     _hook.seen.append(industry)
     return ("A62SYS", _etfs, "ETFEV", "ETFPER", None)
 
 
 _hook.seen = []
 
+# 带档位的证据条目：房地产持 P1（闸门一靠它检测"模型跳过 P1"）
+_TIERS = [{"tier": "P1", "industry": "电子"},
+          {"tier": "E2", "industry": "银行"}]
 
-def _run(script):
+
+def _run(script, tiers=None):
     _hook.seen = []
     _llm = _FakeLLM(script)
     _out = _pipeline._decide(_FakeCtx(_llm), "agent6", "A6SYS", _stocks,
-                             "EV", "PER", _TOP2, etf_hook=_hook)
+                             "EV", "PER", _TOP2, etf_hook=_hook,
+                             tier_items=_TIERS if tiers is None else tiers)
     return _out, _llm.calls
 
 
 from src import pipeline as _pipeline  # noqa: E402
+import inspect as _ins  # noqa: E402
 
 # 场景 A：股票被否(涉P1) → 用【同行业】ETF 回应 → 认可
-# 新规则：插入【不消耗股票轮次】，所以 ETF 那一审用 r1 的 tag。
+# 注意：本轮提案【就是 P1】，所以闸门（一）自否检测不触发，走闸门（二）审计否。
 _a, _calls = _run([("agent6", "agent6:r1", _A6), ("audit", "audit:r1", _P1NO),
                    ("agent62", "agent62:p1insert1", _A62), ("audit", "audit:r1", _OK)])
 assert _a["decision"] == "买入" and _a["code"] == "159997", _a
@@ -421,6 +456,26 @@ assert _a["rounds"] == 1, f"插入不消耗股票轮次，rounds 应为 1，实�
 assert _calls == ["agent6@agent6:r1", "audit@audit:r1",
                   "agent62@agent62:p1insert1", "audit@audit:r1"], _calls
 assert len(_a["p1_etf_inserts"]) == 1
+assert _a["p1_etf_inserts"][0]["trigger"] == "审计否 P1"
+assert _hook.seen == ["电子"], f"hook 应只收到被否 P1 所在行业，实际 {_hook.seen}"
+
+# 场景 A2【路线 2 的核心】：模型【自己跳过 P1】（提案是 E2，池内有 P1）
+# → 闸门（一）在【审计之前】就要插 ETF；若不插，审计会认可 E2 直接结束。
+_a2, _calls2 = _run([
+    ("agent6", "agent6:r1", {"decision": "买入", "code": "000776", "name": "广发证券",
+                             "industry": "银行", "tier_basis": ["E2"],
+                             "reason": "P1 有明显缺陷，故跳过，改选 E2"}),
+    ("agent62", "agent62:p1insert1", _A62),          # 闸门（一）插入
+    ("audit", "audit:r1", _OK),                      # ETF 被认可
+])
+assert _a2["decision"] == "买入" and _a2["code"] == "159997", _a2
+assert _hook.seen == ["电子"], f"自否也应回应该 P1 所在行业，实际 {_hook.seen}"
+assert len(_a2["p1_etf_inserts"]) == 1
+assert _a2["p1_etf_inserts"][0]["trigger"] == "模型自否/跳过 P1"
+assert "agent62@agent62:p1insert1" in _calls2
+assert _calls2[0] == "agent6@agent6:r1" and _calls2[1].startswith("agent62"), \
+    f"自否检测必须在审计之前，实际序列 {_calls2}"
+
 assert _hook.seen == ["电子"], f"hook 应只收到被否股票所在行业，实际 {_hook.seen}"
 
 # 场景 B：ETF 也被否 → 回股票层走【正常流程】（r2，不是 r3）
@@ -433,27 +488,72 @@ assert "agent6@agent6:r2" in _calls, f"应回股票层走正常流程 r2：{_cal
 # 只插一次：即使后面还有 P1 被否，也不再插
 assert sum(1 for c in _calls if "agent62" in c) == 1, f"只应插一次：{_calls}"
 
-# 场景 B2：P1 被否 → 插 ETF（被否）→ 股票 r2 又因 P1 被否 → 【不得再插】
-# 注意：三轮的 gap_type 必须互不相同，否则会先触发「审计保险」（同类理由→直接空仓）。
+# 场景 B2：P1 被否 → 插 ETF（被否）→ 股票 r2 又因 P1 被否 → 再插一次
+# 用户定案：ETF 环节【全局】预算 3；插入占其中，阶段1 最多插 2 次（留 1 轮给阶段2）。
+# 注意：各次审计的 gap_type 必须互不相同，否则会先触发「审计保险」（同类理由→直接空仓）。
 _b2, _calls2 = _run([("agent6", "agent6:r1", _A6), ("audit", "audit:r1", _P1NO),
                      ("agent62", "agent62:p1insert1", _A62), ("audit", "audit:r1", _ENO),
                      ("agent6", "agent6:r2", _A6),
                      ("audit", "audit:r2", {"verdict": "不认可", "gap_type": "传导链过长",
                                             "gap_detail": "链路多一步", "what_would_change_my_mind": "补"}),
+                     ("agent62", "agent62:p1insert2", _A62),
+                     ("audit", "audit:r2", {"verdict": "不认可", "gap_type": "方向相反",
+                                            "gap_detail": "方向不一致", "what_would_change_my_mind": "补"}),
                      ("agent6", "agent6:r3", _A6), ("audit", "audit:r3", _OK)])
 assert _b2["decision"] == "买入", _b2
-assert sum(1 for c in _calls2 if "agent62" in c) == 1, \
-    f"P1 闸门只插一次，第二次被否不得再插：{_calls2}"
+assert sum(1 for c in _calls2 if "agent62" in c) == 2, \
+    f"阶段1 应插 2 次（上限 _MAX_P1_INSERT=2）：{_calls2}"
 assert _b2["rounds"] == 3, _b2["rounds"]
+assert _b2["etf_used"] == 2, f"用了 2 次 ETF 预算，实际 {_b2.get('etf_used')}"
 
-# 场景 C：与 P1 无关的否决 → 不插入 ETF
+# 插入次数上限：阶段1 最多插 2 次（第 3 轮即使又被否也不插）
+_b3, _calls3 = _run([("agent6", "agent6:r1", _A6), ("audit", "audit:r1", _P1NO),
+                     ("agent62", "agent62:p1insert1", _A62), ("audit", "audit:r1", _ENO),
+                     ("agent6", "agent6:r2", _A6),
+                     ("audit", "audit:r2", {"verdict": "不认可", "gap_type": "传导链过长",
+                                            "gap_detail": "x", "what_would_change_my_mind": "y"}),
+                     ("agent62", "agent62:p1insert2", _A62),
+                     ("audit", "audit:r2", {"verdict": "不认可", "gap_type": "方向相反",
+                                            "gap_detail": "z", "what_would_change_my_mind": "w"}),
+                     ("agent6", "agent6:r3", _A6),
+                     ("audit", "audit:r3", {"verdict": "不认可", "gap_type": "证据缺失",
+                                            "gap_detail": "q", "what_would_change_my_mind": "r"})])
+assert sum(1 for c in _calls3 if "agent62" in c) == 2, \
+    f"阶段1 插入上限应为 {_pipeline._MAX_P1_INSERT}：{_calls3}"
+assert _pipeline._MAX_P1_INSERT == 2 and _pipeline.ETF_TOTAL_BUDGET == 3, \
+    "预算常量应为 _MAX_P1_INSERT=2 / ETF_TOTAL_BUDGET=3"
+
+# 场景 B4：插入的 ETF【不得携带被否方案/被否理由】（独立调用）
+# 只检查真正发给模型的 user 文本，不看 docstring/注释。
+import ast as _ast  # noqa: E402
+_src4 = _ins.getsource(_pipeline._p1_etf_respond)
+_user_lits: list[str] = []
+for _node in _ast.walk(_ast.parse(_src4)):
+    if isinstance(_node, _ast.Call) and getattr(_node.func, "attr", "") == "call":
+        for _a in _node.args:
+            if isinstance(_a, _ast.JoinedStr):        # f-string
+                for _v in _a.values:
+                    if isinstance(_v, _ast.Constant) and isinstance(_v.value, str):
+                        _user_lits.append(_v.value)
+            elif isinstance(_a, _ast.Constant) and isinstance(_a.value, str):
+                _user_lits.append(_a.value)
+_user_text = " ".join(_user_lits)
+assert _user_text, "未找到插入 ETF 的 user 文本（测试失效）"
+for _bad in ("已被否决", "被审计否决", "被否的", "否决"):
+    assert _bad not in _user_text, f"插入的 ETF user 文本仍携带被否信息：{_bad}"
+assert "本次只评估一个行业" in _user_text, "插入的 ETF 未声明只评估一个行业"
+
+# 场景 C：池内【无 P1】时的普通否决 → 不插入 ETF
+# 注意：必须传"池内无 P1"的证据，否则"提案是 E1 而池内有 P1"本身就是模型跳过 P1，
+# 闸门（一）会正确触发插入 —— 那是场景 A2 而非 C。
 _c, _calls = _run([("agent6", "agent6:r1", {**_A6, "tier_basis": ["E1"]}),
                    ("audit", "audit:r1", _noP1),
                    ("agent6", "agent6:r2", {"decision": "空仓", "reason": "补不了"}),
-                   ("audit", "audit:r2", _OK)])
-assert not any("agent62" in c for c in _calls), f"不应插入 ETF：{_calls}"
+                   ("audit", "audit:r2", _OK)],
+                  tiers=[{"tier": "E1", "industry": "电子"}])
+assert not any("agent62" in c for c in _calls), f"池内无 P1 时不应插入 ETF：{_calls}"
 
-# 场景 D：3 轮耗尽 → 空仓
+# 场景 D：3 轮耗尽 → 空仓（池内无 P1）
 _d, _calls = _run([("agent6", "agent6:r1", {**_A6, "tier_basis": ["E1"]}),
                    ("audit", "audit:r1", _noP1),
                    ("agent6", "agent6:r2", {**_A6, "tier_basis": ["E1"]}),
@@ -461,10 +561,41 @@ _d, _calls = _run([("agent6", "agent6:r1", {**_A6, "tier_basis": ["E1"]}),
                                           "gap_detail": "a", "what_would_change_my_mind": "b"}),
                    ("agent6", "agent6:r3", {**_A6, "tier_basis": ["E1"]}),
                    ("audit", "audit:r3", {"verdict": "不认可", "gap_type": "方向相反",
-                                          "gap_detail": "c", "what_would_change_my_mind": "d"})])
+                                          "gap_detail": "c", "what_would_change_my_mind": "d"})],
+                  tiers=[{"tier": "E1", "industry": "电子"}])
 assert _d["decision"] == "空仓" and _d["rounds"] == 3, _d
-# 插入上限必须是 1（用户定案：只插一次）
-assert _pipeline._MAX_ETF_INSERTS == 1, f"插入上限应为 1，实际 {_pipeline._MAX_ETF_INSERTS}"
+# 预算常量（用户定案：ETF 环节全局 3 次，阶段1 插入最多占 2 次）
+assert _pipeline.ETF_TOTAL_BUDGET == 3, f"ETF 预算应为 3，实际 {_pipeline.ETF_TOTAL_BUDGET}"
+assert _pipeline._MAX_P1_INSERT == 2, f"阶段1 插入上限应为 2，实际 {_pipeline._MAX_P1_INSERT}"
+
+# 跨阶段预算接线：阶段1 用掉的 ETF 次数必须传给阶段2（全局 3 次）
+assert "etf_used: int = 0" in _ins.getsource(_pipeline.stage_agent62), \
+    "stage_agent62 未接收 etf_used"
+assert "ETF_TOTAL_BUDGET - int(etf_used or 0)" in _ins.getsource(_pipeline.stage_agent62), \
+    "stage_agent62 未按剩余预算计算轮数"
+assert "max_rounds=remaining" in _ins.getsource(_pipeline.stage_agent62), \
+    "stage_agent62 未把剩余预算作为轮数上限"
+assert "etf_used=_etf_used_stock" in _read_or_empty("src/pipeline.py"), \
+    "阶段2 调用处未传 etf_used"
+assert "max_rounds" in _ins.signature(_pipeline._decide).parameters, \
+    "_decide 未支持 max_rounds"
+# 插入 prompt 不得携带被否信息（只查真正发给模型的 user 文本）
+import ast as _ast  # noqa: E402
+_user_lits: list[str] = []
+for _node in _ast.walk(_ast.parse(_ins.getsource(_pipeline._p1_etf_respond))):
+    if isinstance(_node, _ast.Call) and getattr(_node.func, "attr", "") == "call":
+        for _a in _node.args:
+            if isinstance(_a, _ast.JoinedStr):
+                for _v in _a.values:
+                    if isinstance(_v, _ast.Constant) and isinstance(_v.value, str):
+                        _user_lits.append(_v.value)
+            elif isinstance(_a, _ast.Constant) and isinstance(_a.value, str):
+                _user_lits.append(_a.value)
+_user_text = " ".join(_user_lits)
+assert _user_text, "未找到插入 ETF 的 user 文本（测试失效）"
+for _bad in ("已被否决", "被审计否决", "被否的", "否决"):
+    assert _bad not in _user_text, f"插入的 ETF user 文本仍携带被否信息：{_bad}"
+assert "本次只评估一个行业" in _user_text, "插入的 ETF 未声明只评估一个行业"
 
 # _gap_touches_p1 判据：只认 P1，不认 P4
 assert _pipeline._gap_touches_p1(_P1NO, {}) is True
@@ -497,11 +628,17 @@ assert _tr["industry_ranking"]["order"] == \
     "P1 > C1 = E1 > P2 > C2 = E2 > P3 = C3 = E3 > P4 = C4 = E4", \
     "等级序被改动了"
 # P1 闸门的审计历史与股票层【共用】（用户定案 2）
+# 插入逻辑已抽进 _p1_etf_respond：它必须把外层同一个 history 传下去。
 import inspect as _ins  # noqa: E402
+_rsrc = _ins.getsource(_pipeline._p1_etf_respond)
+assert "_audit(ctx, etf_plan, tag_r, schema, history)" in _rsrc, \
+    "插入 ETF 的审计必须传共用的 history"
+assert "history: list[str]" in _rsrc, "helper 签名未接共享 history"
 _dsrc = _ins.getsource(_pipeline._decide)
-assert "history)" in _dsrc, "插入 ETF 的审计未传共用 history"
-assert "独立" not in _dsrc.split("_audit(ctx, etf_plan")[1][:60], \
-    "插入 ETF 的审计历史应共用，不应独立"
+assert "history" in _dsrc and "_p1_etf_respond" in _dsrc, "闸门未通过 helper 走共享 history"
+# 两条触发路径都必须存在（审计否 + 模型自否）
+assert "审计否 P1" in _dsrc, "缺『审计否 P1』触发路径"
+assert "模型自否/跳过 P1" in _dsrc, "缺『模型自否/跳过 P1』触发路径（路线 2）"
 import inspect as _inspect  # noqa: E402
 assert "etf_hook" not in _inspect.getsource(_pipeline.stage_agent62), \
     "阶段2（stage_agent62）不应带 P1 插入钩子"

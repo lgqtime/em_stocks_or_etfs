@@ -327,8 +327,16 @@ def report(date: str) -> str:
 
 
 if __name__ == "__main__":
-    dates = sys.argv[1:] or ["2026-09-10"]
-    for d in dates:
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if not args:
+        # 之前这里静默回退到某个写死的日期 —— 会把"忘了给参数"变成
+        # "悄悄重写了那一天的报告"，很难发现。改成必须是显式日期，
+        # 或显式 --all（重生成 runs/ 下全部日期的报告）。
+        if "--all" not in sys.argv:
+            sys.exit("用法: python report.py <日期> [日期 ...]  或  python report.py --all\n"
+                     "（不提供日期时不再回退到写死的默认值）")
+        args = sorted(p.name for p in (ROOT / "runs").iterdir() if p.is_dir())
+    for d in args:
         txt = report(d)
         out = ROOT / "runs" / d / "REPORT.md"
         out.write_text(txt, encoding="utf-8", newline="\n")

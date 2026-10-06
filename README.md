@@ -40,9 +40,16 @@ python -m src evaluate 2026-09-10        # 用已落盘的决策复盘单日收�
 python -m src.release v2.0 "说明"        # 原则三：版本留档 + SHA256 清单
 python preflight.py 2026-09-10           # 数据源体检（含窗口越界断言）
 python repeat.py 2026-09-10 3            # 同一输入反复跑，量出模型随机的摆幅
+python report.py 2026-09-10              # 生成/刷新 runs/<日期>/REPORT.md
+python report.py --all                   # 刷新 runs/ 下全部日期的报告
 python selftest.py                       # 三关硬过滤 / 第3关排序 / 提示词渲染 / 行情口径自检
-python showprompts.py                    # 打印每个 Agent 实际发出的提示词
+python showprompts.py                    # 生成 PROMPTS.md（写文件；--stdout 才打到终端）
 ```
+
+⚠️ `report.py` 与 `repeat.py` 的日期**必须显式给出**：它们不再回退到写死的默认值
+（那种静默回退会把"忘了给参数"变成"悄悄重写了某一天的报告"）。
+`showprompts.py` 默认**写 `PROMPTS.md`**，不要用 `> PROMPTS.md` 重定向 ——
+PowerShell 的 `>` 会以 UTF-16LE 写文件，导致它变成二进制、每次生成整文件 diff。
 
 密钥放 `.env` 的 `DEEPSEEK_API_KEY`（`.env` 已在 `.gitignore`，不会入库）。
 
@@ -74,10 +81,16 @@ git config --local core.sshCommand "ssh -i 'C:/Users/Lenovo/.ssh/github_ed25519'
 采集(东财7x24 A窗+B窗 / 新浪外围10指标)
   → 第0关 原料清洗 ── Agent1 分类 ── 第1关 类目剔除
   → Agent2 摘要 ── Agent3 唯一行业归属 ── 第2关 行业清洗
-  → Agent4 判级 ── Agent42 档位审查 ── 第3关 推举5行业（纯代码）
-  → Agent5 证据精选 ── Agent6 选股 ── 审计（不认可则回退≤3轮）
-  → 股票层最终空仓时才启用 Agent62(ETF) ── 审计（≤3轮）
+  → Agent4 判级 ── Agent42 档位审查（P 档锁定）
+  → 第3关 推举5行业（纯代码）
+  → Agent5 证据精选 ── Agent52 消息→个股 ── 第4关 剔除「其他」
+  → Agent6 选股 ── 审计（不认可则回退 ≤3 轮）
+       └─ 只要 P1 被否（模型自否 或 审计否）→ 用【同行业 ETF】独立回应一次
+  → 股票层最终空仓时才启用 Agent62(ETF) ── 审计（≤3 轮）
 ```
+
+**ETF 环节的预算是全局 3 次**：阶段1 的 P1 插入与阶段2 的正式 ETF 共用它
+（插入不消耗股票轮次，但占用这 3 次）。详见 `PROJECT_PLAN.md` §9.1。
 
 三关硬过滤、第3关排序、标的合法性校验全部是**纯代码**（`src/filter/hard.py`）。
 
@@ -94,9 +107,13 @@ src/          configs.py 基础文件加载 · http.py 自适应限速 · market
   llm/        client.py 模型分档与缓存 · prompts.py 各 Agent 提示词
   pipeline.py predict() 唯一入口
   backtest.py 回测 · cli.py 命令行 · release.py 版本留档
-runs/<日期>/  raw/ filtered/ analysis/ meta.json     ← 原则一
-.cache/llm/   内容寻址的 LLM 缓存（批量提取类 agent1–5 才缓存；决策类
-              agent6/62 与审计不缓存，避免把"第一次碰巧算出的结论"冻死）
+runs/<日期>/  raw/ filtered/ analysis/ meta.json REPORT.md     ← 原则一
+.cache/llm/   内容寻址的 LLM 缓存（键含提示词全文）。**批量提取类**
+              agent1/2/3/4/42/5/52 才缓存；**决策与审计类** agent6/62/audit
+              不缓存 —— 避免把"第一次碰巧算出的结论"冻死。改任何提示词
+              都会让该 Agent 的缓存失效，下次必重算。
+docs/         KNOWN_ISSUES.md —— 已知问题与实测证据台账
+              （⚠️ 只供人工审计，**不得被任何 Agent 的提示词或输入引用**）
 releases/     版本留档                                      ← 原则三
 ```
 

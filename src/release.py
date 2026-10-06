@@ -44,6 +44,11 @@ def build(version: str, note: str) -> Path:
         f = ROOT / name
         if f.exists():
             shutil.copy2(f, dest / name)
+    # docs/ 也必须留档：KNOWN_ISSUES.md 是调参依据与已知缺陷台账，
+    # 缺了它，留档里的判据就成了"没有出处的规则"，事后无法审计。
+    docs = ROOT / "docs"
+    if docs.is_dir():
+        shutil.copytree(docs, dest / "docs", dirs_exist_ok=True)
     plan = ROOT / "PROJECT_PLAN.md"
     if plan.exists():
         shutil.copy2(plan, dest / "PROJECT_PLAN_V2.md")

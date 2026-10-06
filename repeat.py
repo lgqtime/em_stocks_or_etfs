@@ -4,6 +4,9 @@
 本脚本就是把它变成可执行的一条命令。
 
     python repeat.py 2026-09-10 3
+
+⚠️ 日期必须显式给出 —— 之前有写死的默认日期，会把"忘了给参数"变成
+   "悄悄反复跑某一天并覆盖它的产物"，这类静默回退很难发现。
 """
 
 import json
@@ -16,7 +19,10 @@ from src import market
 from src.http import Client
 from src.pipeline import predict
 
-date = sys.argv[1] if len(sys.argv) > 1 else "2026-09-10"
+if len(sys.argv) < 2:
+    sys.exit("用法: python repeat.py <日期> [次数=3]\n"
+             "（日期必须显式给出，不再回退到写死的默认值）")
+date = sys.argv[1]
 n = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 client = Client()
 
