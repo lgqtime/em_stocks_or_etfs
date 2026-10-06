@@ -785,7 +785,12 @@ assert PL._cap(ti, 0) == [] and len(PL._cap(ti, 99)) == 4
 
 # --- 基础文件 ---------------------------------------------------------------
 s, e = configs.load_stocks(), configs.load_etfs()
-assert s.count == 59 and len(s.level1_names) == 28, (s.count, len(s.level1_names))
+assert s.count == 58 and len(s.level1_names) == 28, (s.count, len(s.level1_names))
+# 银行行业只保留宁波银行（用户定案：剔除青农商行 002958）
+assert s.find("002958") is None, "青农商行 应已从个股池剔除"
+assert [i.code for i in s.items_of_l1.get("银行", [])] == ["002142"], \
+    "银行行业应只剩宁波银行"
+assert "银行" in s.level1_names, "剔除后『银行』仍须是一个可选行业（行业级证据要用）"
 assert e.count == 48 and len(e.level1_names) == 21, (e.count, len(e.level1_names))
 assert s.find("002594").name == "比亚迪"
 assert s.find("比亚迪").code == "002594"
