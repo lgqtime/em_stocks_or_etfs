@@ -274,10 +274,14 @@ def stage_collect(ctx: Ctx, *, refresh: bool = False) -> None:
 # 各阶段
 # --------------------------------------------------------------------------
 def stage_f0(ctx: Ctx) -> list[dict]:
-    kept, dropped = hard.hard_filter_0(ctx.news, ctx.blacklist)
+    # 传交易日：第0关据此剔除"正文含过去日期"的快讯（用户定案）
+    _td = dt.date.fromisoformat(ctx.date)
+    kept, dropped = hard.hard_filter_0(ctx.news, ctx.blacklist, trade_date=_td)
     ctx.kept("f0", kept)
     ctx.drop("f0", dropped)
-    ctx.mark("f0_原料清洗", 输入=len(ctx.news), 保留=len(kept), 剔除=len(dropped))
+    _pd = sum(1 for d in dropped if "正文含过去" in (d.get("drop_reason") or ""))
+    ctx.mark("f0_原料清洗", 输入=len(ctx.news), 保留=len(kept), 剔除=len(dropped),
+             **({"过去日期剔除": _pd} if _pd else {}))
     return kept
 
 

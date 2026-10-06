@@ -65,8 +65,43 @@ def _is_meeting_preview(title: str, content: str) -> bool:
     return not _SUBSTANCE.search(text)   # 有实质动词则保留
 
 
-def hard_filter_0(news: list[dict], blacklist: list[str]) -> tuple[list[dict], list[dict]]:
-    """原料清洗。返回 (保留, 剔除记录)。"""
+_MONTH_RE = re.compile(r"(\d{1,2})\s*月")
+
+
+def past_date_reason(content: str, trade_date) -> str | None:
+    """快讯【正文】里是否出现"早于 T-1 的日期"。
+
+    用户定案（T = 交易日）：
+      · 正文含「M月」，M < T月                 → 删
+      · 正文含「T月D日」，D < T日 − 1          → 删
+        （即允许 T-1 那一天；T-2 及更早一律删）
+
+    命中即删，用来剔除"对已发生事情的回顾/总结"—— 那类消息对明日开盘价没有预测力。
+    ⚠️ 「M月」这条【不看年份】：用户明确要求如此。
+      因此 `2027年3月30日起推出`（未来事件）与 `2025年1月以来的新高`（历史对比基准）
+      也会命中被删 —— 这是已知的取舍，记录下来备查。
+    """
+    if not content:
+        return None
+    for m in _MONTH_RE.finditer(content):
+        mm = int(m.group(1))
+        if 1 <= mm <= 12 and mm < trade_date.month:
+            return f"正文含过去月份[{mm}月<{trade_date.month}月]"
+    cut = trade_date.day - 1
+    if cut >= 1:
+        for m in re.finditer(rf"{trade_date.month}\s*月\s*(\d{{1,2}})\s*日", content):
+            dd = int(m.group(1))
+            if dd < cut:
+                return f"正文含过去日期[{trade_date.month}月{dd}日<{trade_date.month}月{cut}日]"
+    return None
+
+
+def hard_filter_0(news: list[dict], blacklist: list[str],
+                  trade_date=None) -> tuple[list[dict], list[dict]]:
+    """原料清洗。返回 (保留, 剔除记录)。
+
+    trade_date 给出时，额外执行「正文含过去日期 → 删」（见 past_date_reason）。
+    """
     words = [w.lower() for w in blacklist if w]
     kept, dropped, seen = [], [], []
     for n in news:
@@ -87,11 +122,16 @@ def hard_filter_0(news: list[dict], blacklist: list[str]) -> tuple[list[dict], l
             elif _is_meeting_preview(title, content):
                 reason = "会议日程预告"
             else:
-                nt = norm_title(title)
-                if nt and any(nt == s or similar(nt, s) >= TITLE_SIM for s in seen):
-                    reason = "标题去重"
+                # 只看【正文】（用户指定），不看标题
+                d = past_date_reason(content, trade_date) if trade_date else None
+                if d:
+                    reason = d
                 else:
-                    seen.append(nt)
+                    nt = norm_title(title)
+                    if nt and any(nt == s or similar(nt, s) >= TITLE_SIM for s in seen):
+                        reason = "标题去重"
+                    else:
+                        seen.append(nt)
 
         (dropped if reason else kept).append({**n, "drop_reason": reason})
     return kept, dropped

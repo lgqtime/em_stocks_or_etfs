@@ -39,6 +39,33 @@ assert reasons["d"] == "空内容", reasons
 assert reasons["e"] == "会议日程预告", reasons
 assert reasons["g"] == "标题去重", reasons
 
+# --- 第0关：正文含"过去日期" → 删（用户定案，T = 交易日）----------------------
+# 规则：· 正文含「M月」，M < T月            → 删
+#       · 正文含「T月D日」，D < T日 − 1     → 删（允许 T-1 当天）
+import datetime as _dt0  # noqa: E402
+_T0 = _dt0.date(2026, 9, 17)
+_pdr = hard.past_date_reason
+assert _pdr("9月16日，国家电网公司发布若干举措", _T0) is None, \
+    "T-1 当天必须保留（A 窗消息正文常写自己的发布日）"
+assert _pdr("9月10日至9月15日累计减持", _T0), "T-2 及更早必须删"
+assert _pdr("创2025年1月以来的新高", _T0), "M月<T月必须删"
+assert _pdr("公司前三季度营收增长", _T0) is None, "无数字月不得误删"
+assert _pdr("12月15日召开股东大会", _T0) is None, "未来月份不得删"
+# ⚠️ 已知取舍（用户明确要求）：M月那条【不看年份】，未来事件与历史基准也会被删
+assert _pdr("将于2027年3月30日起推出", _T0), "按定案：未来年份的 M月 也删"
+# 只查【正文】，不查标题
+_n0 = [{"code": "z", "title": "标题含3月的消息", "content": "正文无日期"}]
+_k0, _d0 = hard.hard_filter_0(_n0, bl, trade_date=_T0)
+assert [k["code"] for k in _k0] == ["z"], "标题里的日期不应触发删除（只查正文）"
+# 传了 trade_date 才生效
+_k1, _d1 = hard.hard_filter_0(
+    [{"code": "y", "title": "t", "content": "9月1日发生的事"}], bl)
+assert [k["code"] for k in _k1] == ["y"], "不传 trade_date 时不应启用日期规则"
+# 第0关会记录剔除原因，便于事后审计
+_kk, _dd = hard.hard_filter_0(
+    [{"code": "w", "title": "t", "content": "9月1日发生的事"}], bl, trade_date=_T0)
+assert not _kk and "正文含过去日期" in _dd[0]["drop_reason"], _dd
+
 # --- 第1关 ------------------------------------------------------------------
 names = ["比亚迪", "宁德时代"]
 k1, d1 = hard.hard_filter_1([
@@ -241,6 +268,26 @@ assert _pd and len(_pd["excluded_subjects"]) == 2, "配置缺 p_domestic_only"
 # P 档的定义本身不得被改动（用户定案：P 判据保持原样，本条只加适用范围）
 assert "P1 强制性、已生效或明确生效日、直接改变经营约束（配额/关税/税率/强制标准/禁限令；" in a4, \
     "P1 档定义被改动了（应保持原样，只加适用范围）"
+
+# --- 部委级等效国家级 → P2（用户定案）----------------------------------------
+# 原因：「工信部等九部门联合发布《智能网联新能源汽车产业发展"十五五"规划》」
+#      原判据的 P2.exclusions 写着"部委级（降为 P3/P4）"，于是被判 P4
+#      → 汽车行业无强档 → 空仓。定案：部委发布即国家级，应为 P2。
+for _kw in ("P2 最高层级表态 —— 【部委级等效国家级】", "部委即国家级，判 P2，【不得】降为 P3/P4",
+            "P2 不看数字", "地方政府 / 地方部门（→P4）",
+            "P3 【非部委主体】已印发的产业规划", "国务院组成部门走 P2，不走这里"):
+    assert _kw in a4, f"Agent4 缺『部委级等效国家级』规则：{_kw}"
+assert "部委级等效国家级" in P.agent42(), "Agent42 未同步部委级规则"
+_mr = configs.load_tier_rules()["judging_rules"].get("p_ministry_rule")
+assert _mr and "一律先按 P2 评估" in _mr["rule"], "配置缺 p_ministry_rule"
+_P2 = configs.load_tier_rules()["judging_rules"]["P"]["P2"]
+assert not any("部委级（降为" in x for x in _P2["exclusions"]), \
+    "P2.exclusions 仍残留『部委级降为 P3/P4』的旧条文"
+assert any("部委" in x for x in _P2["triggers"]), "P2.triggers 未纳入部委级主体"
+_plan_p2 = _read_or_empty("PROJECT_PLAN.md")
+assert "「部委级等效国家级」（用户定案）" in _plan_p2, "方案未同步部委级规则"
+assert "P2 与 P3 的分界因此从" in _plan_p2, "方案未说明 P2/P3 分界的变化"
+
 
 # --- 地方财政补贴判 P1（用户定案）--------------------------------------------
 # 原因：P1 与 P4 在"地方补贴"上原本无定论，同一类消息一轮判 P1、一轮判 P4，
