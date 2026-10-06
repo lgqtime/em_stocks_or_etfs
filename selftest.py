@@ -785,15 +785,21 @@ assert PL._cap(ti, 0) == [] and len(PL._cap(ti, 99)) == 4
 
 # --- 基础文件 ---------------------------------------------------------------
 s, e = configs.load_stocks(), configs.load_etfs()
-assert s.count == 58 and len(s.level1_names) == 28, (s.count, len(s.level1_names))
+assert s.count == 57 and len(s.level1_names) == 28, (s.count, len(s.level1_names))
 # 银行行业只保留宁波银行（用户定案：剔除青农商行 002958）
 assert s.find("002958") is None, "青农商行 应已从个股池剔除"
 assert [i.code for i in s.items_of_l1.get("银行", [])] == ["002142"], \
     "银行行业应只剩宁波银行"
 assert "银行" in s.level1_names, "剔除后『银行』仍须是一个可选行业（行业级证据要用）"
+# 已剔除比亚迪 002594（用户定案：它不是一只良好的股票）
+assert s.find("002594") is None, "比亚迪 应已从个股池剔除"
+assert [i.code for i in s.items_of_l1.get("汽车", [])] == ["002984"], \
+    "汽车行业应只剩森麒麟"
+assert "汽车" in s.level1_names, "剔除后『汽车』仍须是一个可选行业"
 assert e.count == 48 and len(e.level1_names) == 21, (e.count, len(e.level1_names))
-assert s.find("002594").name == "比亚迪"
-assert s.find("比亚迪").code == "002594"
+# 池内按名/码反查（用仍在池内的标的；比亚迪已剔除，改用它验证）
+assert s.find("002142").name == "宁波银行"
+assert s.find("宁波银行").code == "002142"
 assert s.find("999999") is None
 assert "电子：半导体" in s.industry_map_text()
 assert "- 通富微电(002156)" in s.candidates_text(["电子"])
