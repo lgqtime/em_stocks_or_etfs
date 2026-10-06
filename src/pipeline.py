@@ -793,9 +793,10 @@ def stage_agent6(ctx: Ctx, upstream, top: list[str], per: list[dict],
                  per_note: str) -> dict:
     """股票层：证据为 hard_filter_4 之后的【每股一束】（不含归入「其他」的消息）。
 
-    P1 闸门：审计否决且理由涉及 P1 时，插入一次 ETF 决策（Agent62）。
-    插入用的是【行业级证据】（同 Agent5 的精选，与阶段2 的 ETF 层一致），
-    但阶段2 本身不走这个钩子 —— 它维持原样。
+    P1 闸门：审计否决且理由涉及 P1 时，用【被否股票所在行业】的 ETF 回应一次。
+      · 插入只认那一个行业的 ETF 候选（用户定案 a：优先以同行业 ETF 回应再判决）
+      · 插入不消耗股票轮次（独立预算，上限 1）
+      · 阶段2 本身不走这个钩子 —— 它维持原样
     """
     selected = ctx.stage_input("agent6", upstream,
                                lambda: ctx.load("analysis/agent5_selected.json"))
@@ -807,9 +808,10 @@ def stage_agent6(ctx: Ctx, upstream, top: list[str], per: list[dict],
     etf_pool = ctx.etfs
     etf_evidence, etf_periphery = _ctx_parts(ctx, selected, top, per_note)
 
-    def _etf_hook():
-        """返回 (system, pool, evidence, periphery, _)，供 _decide 插入使用。"""
-        return (P.agent62(etf_pool.candidates_text(top)), etf_pool,
+    def _etf_hook(industry: str):
+        """只为【被否股票所在行业】构造 ETF 决策所需的一切。"""
+        only = [industry] if industry else []
+        return (P.agent62(etf_pool.candidates_text(only)), etf_pool,
                 etf_evidence, etf_periphery, None)
 
     return _decide(ctx, "agent6", P.agent6(cand), pool, evidence, periphery, top,
@@ -875,7 +877,7 @@ def _gap_touches_p1(verdict: dict, plan: dict) -> bool:
     return (verdict.get("gap_type") or "") in _P_GAP_TYPES
 
 
-_MAX_ETF_INSERTS = 3          # 与轮次上限一致：插入本身消耗一轮
+_MAX_ETF_INSERTS = 1          # 用户定案：P1 被否后只插一次 ETF
 
 
 def _decide(ctx: Ctx, agent: str, system: str, pool: Pool,
@@ -883,10 +885,13 @@ def _decide(ctx: Ctx, agent: str, system: str, pool: Pool,
             etf_hook=None) -> dict:
     """决策 + 审计回退（最多 3 轮）。3 轮仍不认可 → 空仓。
 
-    etf_hook（仅股票层用）：审计【不认可且理由涉及 P1】时，插入一次 ETF 决策。
-      · 插入【消耗一轮】（与股票层共用那 3 轮），最多插 3 次
-      · ETF 插入也只审一次；不被认可以后回到股票层，用剩余轮数继续
+    etf_hook（仅股票层用）：审计【不认可且理由涉及 P1】时，插入【一次】ETF 回应。
+      · 【只插一次】（inserts 上限 1），且【不消耗股票轮次】
+      · 【只认被否股票所在的那个行业】—— 用同行业的行业级 ETF，回应"P1 强档股票被否"
+      · ETF 插入也只审一次；不被认可以后回股票层走【正常流程】（r2/r3）
       · 阶段2 的 ETF 层（stage_agent62）不走这个 hook，维持原样
+
+    hook 签名：hook(industry: str) -> (system, pool, evidence, periphery, _)
     """
     schema = (f"【精选证据】\n{evidence}\n\n【外围（外盘指数 + 外围消息原文）】\n{periphery}\n\n"
               f"入选的 5 个行业：{'、'.join(top)}")
@@ -895,7 +900,7 @@ def _decide(ctx: Ctx, agent: str, system: str, pool: Pool,
     chosen: list[dict] = []          # P1 插入的 ETF 尝试记录（写进产物供审计）
     prev = None
     inserts = 0
-    consumed = 0                     # 已消耗的轮数（股票尝试与 ETF 插入共用）
+    consumed = 0                     # 已消耗的【股票】轮数（ETF 插入不计入）
     while consumed < 3:
         consumed += 1                                # 本轮（股票尝试）消耗一轮
         tag_r = consumed
@@ -942,45 +947,57 @@ def _decide(ctx: Ctx, agent: str, system: str, pool: Pool,
         rejected.append(verdict)
         prev = plan
 
-        # --- P1 闸门：否决理由涉及 P1 时，插入一次 ETF（消耗一轮）-------------
+        # --- P1 闸门：否决理由涉及 P1 时，用【同行业 ETF】回应一次 -------------
+        # 用户定案：P1 强档股票被否 → 优先以【该股票所在行业】的 ETF 回应，再判决。
+        #   · 只插一次（_MAX_ETF_INSERTS=1）
+        #   · 【不消耗股票轮次】—— 独立预算，插完仍回股票层走正常流程（r2/r3）
+        #   · 插入的 ETF 只看被否股票所在行业（(a) 口径）
         if (etf_hook is not None and inserts < _MAX_ETF_INSERTS
-                and consumed < 3 and _gap_touches_p1(verdict, plan)):
-            consumed += 1                        # ETF 插入也消耗一轮
-            try:
-                sub_system, sub_pool, sub_ev, sub_per, _ = etf_hook()
-            except Exception as e:  # noqa: BLE001
-                errors.append(f"P1 插入 ETF 失败（{type(e).__name__}: {e}），跳过本次插入")
-                prev = None
-                continue
-            if not sub_pool.candidates_text(top).strip():
-                errors.append("P1 插入 ETF 失败：所选行业在 ETF 池中无候选标的，跳过本次插入")
-                prev = None
-                continue
-            res2 = ctx.llm.call("agent62", sub_system,
-                                f"【精选证据】\n{sub_ev}\n\n【外围（外盘指数 + 外围消息原文）】\n"
-                                f"{sub_per}\n\n入选的 5 个行业：{'、'.join(top)}",
-                                tag=f"agent62:p1insert{consumed}")
-            try:
-                etf_plan = res2.json()
-            except ValueError:
-                etf_plan = {"decision": "空仓",
-                            "reason": f"ETF 输出无法解析：{res2.error or '格式错误'}"}
-            if etf_plan.get("decision") == "买入":
-                it = sub_pool.find(etf_plan.get("code") or "") or sub_pool.find(etf_plan.get("name") or "")
-                etf_plan = ({**etf_plan, "code": it.code, "name": it.name} if it
-                            else {**etf_plan, "decision": "空仓", "_invalid": True,
-                                  "reason": "所推举 ETF 不在候选池内 → 空仓"})
-            v2 = _audit(ctx, etf_plan, consumed, schema, history)
-            chosen.append({"round": consumed, "plan": etf_plan, "audit": v2})
-            inserts += 1
-            if v2.get("verdict") == "认可":
-                return {**etf_plan, "rounds": consumed, "audit": v2,
-                        "audit_history": rejected, "p1_etf_inserts": chosen}
-            # ETF 也被否 → 回股票层，用剩余轮数
-            history.append(v2.get("gap_type") or "证据缺失")
-            rejected.append(v2)
+                and _gap_touches_p1(verdict, plan)):
+            ind = (plan.get("industry") or "").strip()
+            if not ind:
+                errors.append("P1 注入 ETF 跳过：被否方案未给出行业，无法定位同行业 ETF")
+            else:
+                inserts += 1                      # 只插一次；【不】动 consumed
+                try:
+                    sub_system, sub_pool, sub_ev, sub_per, _ = etf_hook(ind)
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"P1 插入 ETF 失败（{type(e).__name__}: {e}）")
+                    sub_pool = None
+                if sub_pool is not None:
+                    if not sub_pool.candidates_text([ind]).strip():
+                        errors.append(f"P1 插入 ETF 跳过：行业「{ind}」在 ETF 池中无候选标的")
+                    else:
+                        res2 = ctx.llm.call(
+                            "agent62", sub_system,
+                            f"【精选证据】\n{sub_ev}\n\n【外围（外盘指数 + 外围消息原文）】\n"
+                            f"{sub_per}\n\n"
+                            f"本次只回应一个行业：{ind}（其 P1 强档股票方案被审计否决，"
+                            f"改由该行业的 ETF 承接，请据此判决）",
+                            tag=f"agent62:p1insert{tag_r}")
+                        try:
+                            etf_plan = res2.json()
+                        except ValueError:
+                            etf_plan = {"decision": "空仓",
+                                        "reason": f"ETF 输出无法解析：{res2.error or '格式错误'}"}
+                        if etf_plan.get("decision") == "买入":
+                            it = (sub_pool.find(etf_plan.get("code") or "")
+                                  or sub_pool.find(etf_plan.get("name") or ""))
+                            etf_plan = ({**etf_plan, "code": it.code, "name": it.name} if it
+                                        else {**etf_plan, "decision": "空仓", "_invalid": True,
+                                              "reason": "所推举 ETF 不在候选池内 → 空仓"})
+                        v2 = _audit(ctx, etf_plan, tag_r, schema, history)
+                        chosen.append({"round": tag_r, "industry": ind,
+                                       "plan": etf_plan, "audit": v2})
+                        if v2.get("verdict") == "认可":
+                            return {**etf_plan, "rounds": consumed, "audit": v2,
+                                    "audit_history": rejected, "p1_etf_inserts": chosen}
+                        # ETF 也被否 → 回股票层走【正常流程】
+                        history.append(v2.get("gap_type") or "证据缺失")
+                        rejected.append(v2)
             prev = None
             continue
+        prev = plan
         prev = plan
     return {"decision": "空仓", "reason": "3 轮审计均不认可 → 空仓",
             "rounds": consumed, "audit": rejected[-1] if rejected else {},

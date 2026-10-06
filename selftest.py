@@ -326,6 +326,21 @@ assert "E 档与 C 档" in _a42p, "Agent42 未声明可改的范围是 E/C"
 assert "P 档锁定" in P.retry("g", "d", "m", "p"), "回退提示词未声明 P 档锁定"
 assert "lock_p_tier" in _read_or_empty("src/pipeline.py"), "pipeline 缺 P 档锁实现"
 
+# --- PROMPTS.md 必须是 UTF-8/LF（不是 UTF-16）--------------------------------
+# 教训：用 PowerShell 的 `>` 重定向会让 PowerShell 以 UTF-16LE 写文件（含 BOM），
+# 结果 PROMPTS.md 变成二进制、每次生成整文件 diff。改为让 showprompts.py 自己写文件。
+_pm = Path("PROMPTS.md")
+if _pm.exists():
+    _pb = _pm.read_bytes()
+    assert b"\x00" not in _pb, "PROMPTS.md 含 NUL —— 被 UTF-16 写坏了"
+    assert not _pb.startswith((b"\xff\xfe", b"\xfe\xff")), "PROMPTS.md 含 UTF-16 BOM"
+    assert b"\r" not in _pb, "PROMPTS.md 含 CR —— 应为 LF"
+    _pb.decode("utf-8")
+    assert _pb.decode("utf-8").count("---------- SYSTEM ----------") == 11, \
+        "PROMPTS.md 未覆盖全部 11 个 agent"
+assert 'newline="\\n"' in _read_or_empty("showprompts.py"), \
+    "showprompts.py 应显式以 newline='\\n' 写文件"
+
 # --- P1 闸门：股票层被否且理由涉及 P1 → 插入一次 ETF（共用那 3 轮）------------
 # 用户设计：股票层 r=1..3；若审计否决理由涉及 P1，插入 Agent62(ETF) 一次并【消耗一轮】；
 # ETF 也被否 → 回 Agent6 用剩余轮数。阶段2（原 ETF 层）不走这个钩子，维持原样。
@@ -378,11 +393,17 @@ _TOP2 = ["电子", "银行"]
 _stocks, _etfs = _cfg.load_stocks(), _cfg.load_etfs()
 
 
-def _hook():
+def _hook(industry: str):
+    """hook 现在收行业参数 —— 只回应被否股票所在行业。"""
+    _hook.seen.append(industry)
     return ("A62SYS", _etfs, "ETFEV", "ETFPER", None)
 
 
+_hook.seen = []
+
+
 def _run(script):
+    _hook.seen = []
     _llm = _FakeLLM(script)
     _out = _pipeline._decide(_FakeCtx(_llm), "agent6", "A6SYS", _stocks,
                              "EV", "PER", _TOP2, etf_hook=_hook)
@@ -391,22 +412,39 @@ def _run(script):
 
 from src import pipeline as _pipeline  # noqa: E402
 
-# 场景 A：股票被否(涉P1) → 插入 ETF → 认可
+# 场景 A：股票被否(涉P1) → 用【同行业】ETF 回应 → 认可
+# 新规则：插入【不消耗股票轮次】，所以 ETF 那一审用 r1 的 tag。
 _a, _calls = _run([("agent6", "agent6:r1", _A6), ("audit", "audit:r1", _P1NO),
-                   ("agent62", "agent62:p1insert2", _A62), ("audit", "audit:r2", _OK)])
+                   ("agent62", "agent62:p1insert1", _A62), ("audit", "audit:r1", _OK)])
 assert _a["decision"] == "买入" and _a["code"] == "159997", _a
-assert _a["rounds"] == 2, _a["rounds"]
+assert _a["rounds"] == 1, f"插入不消耗股票轮次，rounds 应为 1，实际 {_a['rounds']}"
 assert _calls == ["agent6@agent6:r1", "audit@audit:r1",
-                  "agent62@agent62:p1insert2", "audit@audit:r2"], _calls
+                  "agent62@agent62:p1insert1", "audit@audit:r1"], _calls
 assert len(_a["p1_etf_inserts"]) == 1
+assert _hook.seen == ["电子"], f"hook 应只收到被否股票所在行业，实际 {_hook.seen}"
 
-# 场景 B：ETF 也被否 → 回股票层用【剩余轮数】（第 3 轮）
+# 场景 B：ETF 也被否 → 回股票层走【正常流程】（r2，不是 r3）
 _b, _calls = _run([("agent6", "agent6:r1", _A6), ("audit", "audit:r1", _P1NO),
-                   ("agent62", "agent62:p1insert2", _A62), ("audit", "audit:r2", _ENO),
-                   ("agent6", "agent6:r3", _A6), ("audit", "audit:r3", _OK)])
+                   ("agent62", "agent62:p1insert1", _A62), ("audit", "audit:r1", _ENO),
+                   ("agent6", "agent6:r2", _A6), ("audit", "audit:r2", _OK)])
 assert _b["decision"] == "买入" and _b["code"] == "000636", _b
-assert _b["rounds"] == 3, _b["rounds"]
-assert "agent6@agent6:r3" in _calls, f"未回到股票层用剩余轮数：{_calls}"
+assert _b["rounds"] == 2, f"插入不消耗轮次，回到股票层应是 r2，实际 rounds={_b['rounds']}"
+assert "agent6@agent6:r2" in _calls, f"应回股票层走正常流程 r2：{_calls}"
+# 只插一次：即使后面还有 P1 被否，也不再插
+assert sum(1 for c in _calls if "agent62" in c) == 1, f"只应插一次：{_calls}"
+
+# 场景 B2：P1 被否 → 插 ETF（被否）→ 股票 r2 又因 P1 被否 → 【不得再插】
+# 注意：三轮的 gap_type 必须互不相同，否则会先触发「审计保险」（同类理由→直接空仓）。
+_b2, _calls2 = _run([("agent6", "agent6:r1", _A6), ("audit", "audit:r1", _P1NO),
+                     ("agent62", "agent62:p1insert1", _A62), ("audit", "audit:r1", _ENO),
+                     ("agent6", "agent6:r2", _A6),
+                     ("audit", "audit:r2", {"verdict": "不认可", "gap_type": "传导链过长",
+                                            "gap_detail": "链路多一步", "what_would_change_my_mind": "补"}),
+                     ("agent6", "agent6:r3", _A6), ("audit", "audit:r3", _OK)])
+assert _b2["decision"] == "买入", _b2
+assert sum(1 for c in _calls2 if "agent62" in c) == 1, \
+    f"P1 闸门只插一次，第二次被否不得再插：{_calls2}"
+assert _b2["rounds"] == 3, _b2["rounds"]
 
 # 场景 C：与 P1 无关的否决 → 不插入 ETF
 _c, _calls = _run([("agent6", "agent6:r1", {**_A6, "tier_basis": ["E1"]}),
@@ -425,6 +463,8 @@ _d, _calls = _run([("agent6", "agent6:r1", {**_A6, "tier_basis": ["E1"]}),
                    ("audit", "audit:r3", {"verdict": "不认可", "gap_type": "方向相反",
                                           "gap_detail": "c", "what_would_change_my_mind": "d"})])
 assert _d["decision"] == "空仓" and _d["rounds"] == 3, _d
+# 插入上限必须是 1（用户定案：只插一次）
+assert _pipeline._MAX_ETF_INSERTS == 1, f"插入上限应为 1，实际 {_pipeline._MAX_ETF_INSERTS}"
 
 # _gap_touches_p1 判据：只认 P1，不认 P4
 assert _pipeline._gap_touches_p1(_P1NO, {}) is True
